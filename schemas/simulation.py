@@ -4,6 +4,7 @@ Pydantic schemas for simulation API requests and responses.
 
 from pydantic import BaseModel, Field, validator
 from typing import List, Dict, Any, Optional
+from datetime import datetime
 from utils.validation import (
     validate_population_size,
     validate_mutation_rate,
@@ -110,6 +111,8 @@ class SimulationResults(BaseModel):
     population_history: List[int] = Field(description="Population size over time")
     resistance_history: List[float] = Field(description="Average resistance over time")
     fitness_history: List[float] = Field(description="Average fitness over time")
+    generation_times: Optional[List[float]] = Field(default=[], description="Time taken per generation")
+    mutation_events: Optional[List[Dict[str, Any]]] = Field(default=[], description="Mutation events data")
     
     @validator('population_history')
     def validate_population_history(cls, v):
@@ -136,19 +139,44 @@ class SimulationResults(BaseModel):
         return v
 
 
+class SimulationMetrics(BaseModel):
+    """Simulation metrics model."""
+    
+    total_mutations: int = Field(default=0, description="Total number of mutations")
+    extinction_events: int = Field(default=0, description="Number of extinction events")
+    resistance_peaks: List[Dict[str, Any]] = Field(default=[], description="Resistance peak data")
+    diversity_index: List[float] = Field(default=[], description="Population diversity over time")
+
+
 class SimulationResponse(BaseModel):
     """Response model for simulation creation."""
     
     simulation_id: str = Field(description="Unique simulation identifier")
     status: str = Field(description="Current simulation status")
+    created_at: Optional[str] = Field(description="Simulation creation timestamp")
     parameters: SimulationParameters = Field(description="Simulation parameters")
     
     @validator('status')
     def validate_status(cls, v):
-        valid_statuses = ['initialized', 'running', 'completed', 'failed', 'cancelled']
+        valid_statuses = ['initialized', 'running', 'completed', 'paused', 'error', 'extinct', 'cancelled']
         if v not in valid_statuses:
             raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
         return v
+
+
+class SimulationProgressUpdate(BaseModel):
+    """Model for real-time simulation progress updates."""
+    
+    simulation_id: str = Field(description="Unique simulation identifier")
+    status: str = Field(description="Current simulation status")
+    current_generation: int = Field(description="Current generation number")
+    progress_percentage: float = Field(description="Completion percentage (0-100)")
+    population_size: int = Field(description="Current population size")
+    average_resistance: float = Field(description="Current average resistance")
+    average_fitness: float = Field(description="Current average fitness")
+    diversity_index: Optional[float] = Field(description="Current diversity index")
+    generation_time: Optional[float] = Field(description="Time taken for this generation")
+    mutations_this_generation: Optional[int] = Field(description="Mutations in current generation")
 
 
 class SimulationStatusResponse(BaseModel):
@@ -156,16 +184,20 @@ class SimulationStatusResponse(BaseModel):
     
     simulation_id: str = Field(description="Unique simulation identifier")
     status: str = Field(description="Current simulation status")
+    created_at: Optional[str] = Field(description="Simulation creation timestamp")
+    updated_at: Optional[str] = Field(description="Last update timestamp")
     current_generation: Optional[int] = Field(description="Current generation (if running)")
+    progress_percentage: Optional[float] = Field(description="Completion percentage (0-100)")
     generations_completed: Optional[int] = Field(description="Total generations completed")
     final_population_size: Optional[int] = Field(description="Final population size")
     final_resistance: Optional[float] = Field(description="Final average resistance")
     parameters: SimulationParameters = Field(description="Simulation parameters")
     results: SimulationResults = Field(description="Simulation results data")
+    metrics: Optional[SimulationMetrics] = Field(description="Simulation metrics")
     
     @validator('status')
     def validate_status(cls, v):
-        valid_statuses = ['initialized', 'running', 'completed', 'failed', 'cancelled']
+        valid_statuses = ['initialized', 'running', 'completed', 'paused', 'error', 'extinct', 'cancelled']
         if v not in valid_statuses:
             raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
         return v
@@ -181,6 +213,12 @@ class SimulationStatusResponse(BaseModel):
         if v is not None and (v < 0 or v > 1):
             raise ValueError("Final resistance must be between 0 and 1")
         return v
+    
+    @validator('progress_percentage')
+    def validate_progress_percentage(cls, v):
+        if v is not None and (v < 0 or v > 100):
+            raise ValueError("Progress percentage must be between 0 and 100")
+        return v
 
 
 class SimulationSummary(BaseModel):
@@ -188,12 +226,15 @@ class SimulationSummary(BaseModel):
     
     simulation_id: str = Field(description="Unique simulation identifier")
     status: str = Field(description="Current simulation status")
+    created_at: Optional[str] = Field(description="Simulation creation timestamp")
+    updated_at: Optional[str] = Field(description="Last update timestamp")
     current_generation: int = Field(description="Current generation")
+    progress_percentage: Optional[float] = Field(description="Completion percentage (0-100)")
     parameters: SimulationParameters = Field(description="Simulation parameters")
     
     @validator('status')
     def validate_status(cls, v):
-        valid_statuses = ['initialized', 'running', 'completed', 'failed', 'cancelled']
+        valid_statuses = ['initialized', 'running', 'completed', 'paused', 'error', 'extinct', 'cancelled']
         if v not in valid_statuses:
             raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
         return v
