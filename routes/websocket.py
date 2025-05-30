@@ -15,6 +15,8 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 
 from services.simulation_service import SimulationService
+from services.reconnection_service import get_reconnection_manager, ReconnectionState
+from services.websocket_error_handler import WebSocketErrorHandler, ErrorCode, ErrorSeverity, ErrorCategory
 from utils.auth import verify_api_key_websocket
 
 router = APIRouter(prefix="/ws", tags=["WebSocket"])
@@ -143,8 +145,31 @@ class EnhancedConnectionManager:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._heartbeat_started: bool = False
         
+        # Lazy initialization for heavy dependencies
+        self._reconnection_manager = None
+        self._error_handler = None
+        self._callbacks_registered = False
+        
         # Don't start heartbeat automatically during import
         # It will be started when first connection is made
+    
+    @property
+    def reconnection_manager(self):
+        """Lazy initialization of reconnection manager."""
+        if self._reconnection_manager is None:
+            self._reconnection_manager = get_reconnection_manager()
+            if not self._callbacks_registered:
+                self._reconnection_manager.register_reconnection_callback(self._handle_reconnection_state_change)
+                self._reconnection_manager.register_message_replay_callback(self._handle_message_replay)
+                self._callbacks_registered = True
+        return self._reconnection_manager
+    
+    @property
+    def error_handler(self):
+        """Lazy initialization of error handler."""
+        if self._error_handler is None:
+            self._error_handler = WebSocketErrorHandler()
+        return self._error_handler
     
     def _start_heartbeat_monitor(self):
         """Start the heartbeat monitoring task."""
@@ -201,6 +226,17 @@ class EnhancedConnectionManager:
             logger.error(f"Failed to send heartbeat to {client_id}: {e}")
             await self.disconnect(client_id, reason="heartbeat_failed")
     
+    def _handle_reconnection_state_change(self, state: ReconnectionState):
+        """Handle reconnection state changes."""
+        logger.info(f"Reconnection state changed to: {state.value}")
+        # Could notify clients about server reconnection status here
+    
+    def _handle_message_replay(self, client_id: str, messages: List[Dict[str, Any]]):
+        """Handle message replay after reconnection."""
+        logger.info(f"Replaying {len(messages)} messages for client {client_id}")
+        # Messages would be replayed when client reconnects
+        # This is handled by the reconnection service
+    
     async def connect(self, websocket: WebSocket, client_id: Optional[str] = None) -> str:
         """Accept a new WebSocket connection and return client ID."""
         if not client_id:
@@ -212,6 +248,9 @@ class EnhancedConnectionManager:
         if not self._heartbeat_started:
             self._start_heartbeat_monitor()
         
+        # Check for existing session recovery
+        session_state = await self.reconnection_manager.handle_successful_connection(client_id)
+        
         # Create connection record
         connection = ClientConnection(
             client_id=client_id,
@@ -221,6 +260,11 @@ class EnhancedConnectionManager:
             last_activity=datetime.now(),
             subscriptions=[]
         )
+        
+        # Restore session state if available
+        if session_state:
+            connection.subscriptions = list(session_state.subscriptions)
+            logger.info(f"Restored session for client {client_id} with {len(session_state.subscriptions)} subscriptions")
         
         self.active_connections[client_id] = connection
         
@@ -237,8 +281,12 @@ class EnhancedConnectionManager:
                     "simulation_streaming",
                     "real_time_updates",
                     "authentication",
-                    "subscription_management"
-                ]
+                    "subscription_management",
+                    "automatic_reconnection",
+                    "session_recovery"
+                ],
+                "session_recovered": session_state is not None,
+                "restored_subscriptions": connection.subscriptions if session_state else []
             }
         )
         
@@ -254,6 +302,18 @@ class EnhancedConnectionManager:
             
         connection = self.active_connections[client_id]
         connection.state = ConnectionState.DISCONNECTING
+        
+        # Save session state for potential reconnection
+        subscriptions = set(connection.subscriptions)
+        auth_token = getattr(connection, 'auth_token', None)
+        await self.reconnection_manager.save_session(
+            client_id=client_id,
+            auth_token=auth_token,
+            subscriptions=subscriptions
+        )
+        
+        # Handle disconnection in reconnection manager
+        await self.reconnection_manager.handle_disconnect(client_id, reason)
         
         try:
             # Send disconnection message
@@ -386,6 +446,18 @@ class EnhancedConnectionManager:
     async def send_to_client(self, client_id: str, message: WebSocketMessage) -> bool:
         """Send a message to a specific client."""
         if client_id not in self.active_connections:
+            # Client is disconnected, queue message for potential replay
+            message_dict = {
+                "type": message.type.value,
+                "timestamp": message.timestamp,
+                "client_id": message.client_id,
+                "simulation_id": message.simulation_id,
+                "data": message.data,
+                "error": message.error
+            }
+            queued = self.reconnection_manager.queue_message(client_id, message_dict)
+            if queued:
+                logger.debug(f"Queued message for disconnected client {client_id}")
             return False
         
         try:
@@ -395,6 +467,16 @@ class EnhancedConnectionManager:
             return True
         except Exception as e:
             logger.error(f"Failed to send message to client {client_id}: {e}")
+            # Queue message before disconnecting
+            message_dict = {
+                "type": message.type.value,
+                "timestamp": message.timestamp,
+                "client_id": message.client_id,
+                "simulation_id": message.simulation_id,
+                "data": message.data,
+                "error": message.error
+            }
+            self.reconnection_manager.queue_message(client_id, message_dict)
             await self.disconnect(client_id, reason="send_failed")
             return False
     
@@ -462,11 +544,16 @@ async def simulation_websocket_endpoint(
     try:
         while True:
             # Receive message from client
+            start_time = time.time()
             raw_data = await websocket.receive_text()
             
             try:
                 # Parse incoming message
                 message = WebSocketMessage.from_json(raw_data, client_id)
+                
+                # Record latency for reconnection service
+                latency_ms = (time.time() - start_time) * 1000
+                manager.reconnection_manager.record_latency(latency_ms)
                 
                 # Update client activity
                 if client_id in manager.active_connections:
