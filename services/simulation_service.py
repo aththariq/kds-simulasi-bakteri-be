@@ -169,6 +169,15 @@ class SimulationService:
         sim_data["status"] = "running"
         sim_data["updated_at"] = datetime.utcnow().isoformat()
         
+        # Update state manager
+        state_manager.update_simulation_state(
+            simulation_id,
+            {
+                "state": SimulationState.RUNNING,
+                "start_time": datetime.utcnow()
+            }
+        )
+        
         population = sim_data["population"]
         selection = sim_data["selection"]
         fitness_calc = sim_data["fitness_calculator"]
@@ -214,6 +223,26 @@ class SimulationService:
                 diversity = population.calculate_diversity_index()
                 sim_data["metrics"]["diversity_index"].append(diversity)
                 
+                # Update state manager with progress
+                state_manager.update_simulation_state(
+                    simulation_id,
+                    {
+                        "current_generation": sim_data["current_generation"],
+                        "progress_percentage": sim_data["progress_percentage"],
+                        "population_size": population.size,
+                        "resistance_frequency": post_mutation_resistance
+                    },
+                    create_snapshot=(generation % 10 == 0)  # Create snapshot every 10 generations
+                )
+                
+                # Create checkpoint every 50 generations
+                if generation % 50 == 0:
+                    state_manager.create_checkpoint(simulation_id, {
+                        "population": population,
+                        "generation": generation,
+                        "simulation_data": sim_data
+                    })
+                
                 # Check for extinction
                 if population.size == 0:
                     sim_data["metrics"]["extinction_events"] += 1
@@ -241,8 +270,28 @@ class SimulationService:
                 await asyncio.sleep(0.01)
             
             # Mark simulation as completed
-            sim_data["status"] = "completed" if population.size > 0 else "extinct"
+            final_status = "completed" if population.size > 0 else "extinct"
+            sim_data["status"] = final_status
             sim_data["updated_at"] = datetime.utcnow().isoformat()
+            
+            # Update state manager with completion
+            state_manager.update_simulation_state(
+                simulation_id,
+                {
+                    "state": SimulationState.COMPLETED,
+                    "end_time": datetime.utcnow(),
+                    "final_population_size": population.size,
+                    "final_resistance": population.get_average_resistance() if population.size > 0 else 0
+                }
+            )
+            
+            # Create final checkpoint
+            state_manager.create_checkpoint(simulation_id, {
+                "population": population,
+                "generation": sim_data["current_generation"],
+                "simulation_data": sim_data,
+                "final_results": sim_data["results"]
+            })
             
             final_results = {
                 "simulation_id": simulation_id,
@@ -261,6 +310,16 @@ class SimulationService:
             sim_data["status"] = "error"
             sim_data["error"] = str(e)
             sim_data["updated_at"] = datetime.utcnow().isoformat()
+            
+            # Update state manager with error
+            state_manager.update_simulation_state(
+                simulation_id,
+                {
+                    "state": SimulationState.ERROR,
+                    "error_message": str(e),
+                    "error_time": datetime.utcnow()
+                }
+            )
             
             error_data = {
                 "simulation_id": simulation_id,

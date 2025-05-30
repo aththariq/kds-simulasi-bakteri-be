@@ -55,6 +55,20 @@ class AuthenticationManager:
         """
         return api_key in self.api_keys and self.api_keys[api_key]["active"]
     
+    def get_user_id_from_api_key(self, api_key: str) -> Optional[str]:
+        """
+        Get user ID associated with an API key.
+        
+        Args:
+            api_key: API key to look up
+            
+        Returns:
+            User ID or None if not found
+        """
+        if api_key in self.api_keys and self.api_keys[api_key]["active"]:
+            return self.api_keys[api_key]["client_name"]
+        return None
+    
     def check_rate_limit(self, api_key: str) -> bool:
         """
         Check if API key has exceeded rate limit.
@@ -199,22 +213,25 @@ class SecurityValidator:
         return hashlib.sha256(sorted_data.encode()).hexdigest()
 
 
-async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+async def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
     """
-    Verify API key from request headers.
+    Verify API key from HTTP Authorization header.
     
     Args:
-        credentials: Authorization credentials
+        credentials: HTTP authorization credentials
         
     Returns:
-        Validated API key
+        API key if valid
         
     Raises:
-        HTTPException: If authentication fails
+        HTTPException: If API key is invalid or missing
     """
     if not credentials:
-        # For development, allow requests without API key
-        return DEFAULT_API_KEY
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
     api_key = credentials.credentials
     
@@ -228,11 +245,44 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     if not auth_manager.check_rate_limit(api_key):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded. Try again later.",
-            headers={"Retry-After": "3600"},
+            detail="Rate limit exceeded"
         )
     
     return api_key
+
+
+async def verify_api_key_websocket(api_key: str) -> str:
+    """
+    Verify API key for WebSocket authentication.
+    
+    Args:
+        api_key: API key to verify
+        
+    Returns:
+        User ID if valid
+        
+    Raises:
+        Exception: If API key is invalid
+    """
+    if not api_key:
+        raise Exception("API key required for WebSocket authentication")
+    
+    if not auth_manager.validate_api_key(api_key):
+        raise Exception("Invalid API key")
+    
+    if not auth_manager.check_rate_limit(api_key):
+        raise Exception("Rate limit exceeded")
+    
+    user_id = auth_manager.get_user_id_from_api_key(api_key)
+    if not user_id:
+        raise Exception("Unable to identify user from API key")
+    
+    return user_id
+
+
+def get_development_api_key() -> str:
+    """Get the development API key for testing purposes."""
+    return DEFAULT_API_KEY
 
 
 async def optional_verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[str]:

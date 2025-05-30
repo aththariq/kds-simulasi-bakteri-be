@@ -12,6 +12,9 @@ import logging
 from config import settings
 from routes.simulation import router as simulation_router
 from routes.websocket import router as websocket_router
+from routes.state import router as state_router
+from routes.performance import router as performance_router
+from routes.results import router as results_router
 from utils.data_transform import DataTransformer, ResponseBuilder
 
 # Configure logging
@@ -94,6 +97,9 @@ async def general_exception_handler(request: Request, exc: Exception):
 # Include routers
 app.include_router(simulation_router)
 app.include_router(websocket_router)
+app.include_router(state_router)
+app.include_router(performance_router)
+app.include_router(results_router)
 
 @app.get("/", tags=["Root"])
 async def root():
@@ -108,6 +114,20 @@ async def root():
             "websocket_endpoints": {
                 "simulation": "/ws/simulation",
                 "global": "/ws/global"
+            },
+            "performance_endpoints": {
+                "metrics": "/api/performance/metrics",
+                "memory": "/api/performance/memory",
+                "benchmark": "/api/performance/benchmark/load-test",
+                "health": "/api/performance/health"
+            },
+            "results_endpoints": {
+                "health": "/api/results/health",
+                "collect": "/api/results/collect",
+                "simulations": "/api/results/simulations",
+                "analysis": "/api/results/simulations/{id}/analysis",
+                "reports": "/api/results/simulations/{id}/report",
+                "export": "/api/results/simulations/{id}/export"
             }
         },
         message="API is running successfully"
@@ -120,7 +140,8 @@ async def health_check():
         data={
             "status": "healthy",
             "version": settings.api_version,
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "performance_optimization": "enabled"
         },
         message="Service is healthy"
     )
@@ -137,6 +158,8 @@ async def api_info():
             "endpoints": {
                 "simulation": "/api/simulations",
                 "websocket": "/ws",
+                "state": "/api/state",
+                "performance": "/api/performance",
                 "health": "/health",
                 "docs": "/docs"
             },
@@ -145,7 +168,12 @@ async def api_info():
                 "WebSocket support",
                 "Rate limiting",
                 "Input validation",
-                "Error handling"
+                "Error handling",
+                "Performance optimization",
+                "Memory profiling",
+                "Load testing",
+                "Benchmarking",
+                "Regression testing"
             ]
         },
         message="API information retrieved successfully"
