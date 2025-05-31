@@ -699,6 +699,22 @@ async def stream_simulation_updates(simulation_id: str, client_id: str):
             # Broadcast to all subscribers
             await manager.broadcast_to_simulation(simulation_id, update_message)
             
+            # Send spatial-specific updates if spatial data is available
+            if "spatial_data" in progress_data:
+                spatial_message = WebSocketMessage(
+                    type=MessageType.SIMULATION_UPDATE,
+                    timestamp=datetime.now().isoformat(),
+                    client_id=client_id,
+                    simulation_id=simulation_id,
+                    data={
+                        "type": "spatial_update",
+                        **progress_data["spatial_data"]
+                    }
+                )
+                
+                # Broadcast spatial data to all simulation subscribers
+                await manager.broadcast_to_simulation(simulation_id, spatial_message)
+            
     except Exception as e:
         logger.error(f"Error in simulation stream {simulation_id}: {e}")
         error_message = WebSocketMessage(
@@ -751,6 +767,100 @@ async def global_websocket_endpoint(websocket: WebSocket):
                 
     except WebSocketDisconnect:
         await manager.disconnect(client_id, reason="client_disconnect")
+
+
+@router.websocket("/spatial/{simulation_id}")
+async def spatial_websocket_endpoint(
+    websocket: WebSocket,
+    simulation_id: str,
+    client_id: Optional[str] = Query(None, description="Optional client ID for reconnection")
+):
+    """
+    WebSocket endpoint specifically for spatial/Petri dish visualization data.
+    
+    Provides real-time updates of:
+    - Bacterial positions and movements
+    - Spatial grid statistics
+    - Antibiotic zone data
+    - Resistance status visualization data
+    """
+    
+    # Establish connection
+    client_id = await manager.connect(websocket, client_id)
+    
+    try:
+        # Subscribe to simulation updates
+        await manager.subscribe_to_simulation(client_id, simulation_id)
+        
+        # Send initial spatial data if simulation exists
+        if simulation_id in simulation_service.active_simulations:
+            sim_data = simulation_service.active_simulations[simulation_id]
+            
+            if "spatial_grid" in sim_data:
+                # Send initial spatial state
+                initial_message = WebSocketMessage(
+                    type=MessageType.SIMULATION_UPDATE,
+                    timestamp=datetime.now().isoformat(),
+                    client_id=client_id,
+                    simulation_id=simulation_id,
+                    data={
+                        "type": "spatial_initialization",
+                        "grid_dimensions": [sim_data["spatial_grid"].width, sim_data["spatial_grid"].height],
+                        "cell_size": sim_data["spatial_grid"].cell_size,
+                        "boundary_condition": sim_data["spatial_grid"].boundary_condition.value,
+                        "current_generation": sim_data.get("current_generation", 0)
+                    }
+                )
+                await websocket.send_text(initial_message.to_json())
+        
+        while True:
+            # Listen for client messages
+            raw_data = await websocket.receive_text()
+            
+            try:
+                message = WebSocketMessage.from_json(raw_data, client_id)
+                
+                if message.type == MessageType.PING:
+                    # Respond to ping
+                    pong_message = WebSocketMessage(
+                        type=MessageType.PONG,
+                        timestamp=datetime.now().isoformat(),
+                        client_id=client_id,
+                        simulation_id=simulation_id
+                    )
+                    await websocket.send_text(pong_message.to_json())
+                
+                elif message.data and message.data.get("type") == "get_spatial_data":
+                    # Send current spatial data
+                    if simulation_id in simulation_service.active_simulations:
+                        sim_data = simulation_service.active_simulations[simulation_id]
+                        if "spatial_data" in sim_data.get("results", {}):
+                            spatial_response = WebSocketMessage(
+                                type=MessageType.SIMULATION_UPDATE,
+                                timestamp=datetime.now().isoformat(),
+                                client_id=client_id,
+                                simulation_id=simulation_id,
+                                data={
+                                    "type": "spatial_update",
+                                    **sim_data["results"]["spatial_data"]
+                                }
+                            )
+                            await websocket.send_text(spatial_response.to_json())
+                
+            except json.JSONDecodeError as e:
+                error_message = WebSocketMessage(
+                    type=MessageType.ERROR,
+                    timestamp=datetime.now().isoformat(),
+                    client_id=client_id,
+                    error=f"Invalid JSON format: {str(e)}"
+                )
+                await websocket.send_text(error_message.to_json())
+                
+    except WebSocketDisconnect:
+        await manager.disconnect(client_id, reason="spatial_client_disconnect")
+    except Exception as e:
+        logger.error(f"Error in spatial WebSocket for {simulation_id}: {e}")
+        await manager.disconnect(client_id, reason="spatial_connection_error")
 
 
 # Helper function to get connection manager stats (for debugging/monitoring)

@@ -70,6 +70,27 @@ class Bacterium:
         """Check if bacterium is antibiotic resistant."""
         return self.resistance_status == ResistanceStatus.RESISTANT
     
+    def is_alive(self) -> bool:
+        """
+        Check if bacterium is alive.
+        
+        For this implementation, we consider bacteria alive if they have positive fitness
+        and are within reasonable age limits. More complex mortality could be added later.
+        
+        Returns:
+            True if bacterium is alive
+        """
+        # Basic viability checks
+        if self.fitness <= 0:
+            return False
+        
+        # Age limit (bacteria don't live forever)
+        max_age = 50  # Arbitrary maximum age in generations
+        if self.age > max_age:
+            return False
+        
+        return True
+    
     @property
     def effective_fitness(self) -> float:
         """

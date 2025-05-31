@@ -10,8 +10,11 @@ import uuid
 from models.population import Population, PopulationConfig
 from models.selection import SelectionPressure
 from models.fitness import ComprehensiveFitnessCalculator
+from models.spatial import SpatialGrid, SpatialManager, BoundaryCondition
 from utils.state_manager import state_manager, SimulationState
+import logging
 
+logger = logging.getLogger(__name__)
 
 class SimulationService:
     """Service class for managing bacterial resistance simulations."""
@@ -77,6 +80,27 @@ class SimulationService:
             # Initialize fitness calculator
             fitness_calc = ComprehensiveFitnessCalculator()
             
+            # Initialize spatial grid system for spatial representation
+            spatial_grid = SpatialGrid(
+                width=100.0,
+                height=100.0,
+                cell_size=1.0,
+                boundary_condition=BoundaryCondition.CLOSED
+            )
+            spatial_manager = SpatialManager(spatial_grid)
+            
+            # Initialize bacterial positions randomly
+            bacterium_ids = [f"bacterium_{i}" for i in range(initial_population_size)]
+            bacterium_positions = spatial_manager.initialize_random_population(
+                population_size=initial_population_size,
+                bacterium_ids=bacterium_ids
+            )
+            
+            # Enable performance optimizations for large populations
+            if initial_population_size > 1000:
+                spatial_manager.optimize_for_large_population(True)
+                logger.info(f"Enabled performance optimizations for {initial_population_size} bacteria")
+            
             # Store simulation data with enhanced metadata
             simulation_data = {
                 "id": simulation_id,
@@ -87,6 +111,9 @@ class SimulationService:
                 "population": population,
                 "selection": selection,
                 "fitness_calculator": fitness_calc,
+                "spatial_grid": spatial_grid,
+                "spatial_manager": spatial_manager,
+                "bacterium_positions": bacterium_positions,
                 "current_generation": 0,
                 "progress_percentage": 0.0,
                 "estimated_completion": None,
@@ -223,6 +250,63 @@ class SimulationService:
                 diversity = population.calculate_diversity_index()
                 sim_data["metrics"]["diversity_index"].append(diversity)
                 
+                # Update spatial positions and extract spatial data
+                spatial_grid = sim_data["spatial_grid"]
+                spatial_manager = sim_data["spatial_manager"]
+                bacterium_positions = sim_data["bacterium_positions"]
+                
+                # Simulate bacterial movement for this generation
+                bacterium_ids_to_move = list(bacterium_positions.keys())[:population.size]
+                
+                # Use batch movement for better performance with large populations
+                if len(bacterium_ids_to_move) > 100:
+                    movements = spatial_manager.simulate_bacterial_movement_batch(
+                        bacterium_ids=bacterium_ids_to_move,
+                        movement_radius=0.3,
+                        movement_probability=0.8
+                    )
+                    # Update positions from batch movement
+                    for bacterium_id, new_position in movements:
+                        if new_position:
+                            bacterium_positions[bacterium_id] = new_position
+                else:
+                    # Use individual movement for smaller populations
+                    for bacterium_id in bacterium_ids_to_move:
+                        new_position = spatial_manager.simulate_bacterial_movement(
+                            bacterium_id, 
+                            movement_radius=0.3
+                        )
+                        if new_position:
+                            bacterium_positions[bacterium_id] = new_position
+                
+                # Get spatial statistics
+                grid_stats = spatial_grid.get_grid_statistics()
+                
+                # Prepare spatial data for client updates
+                spatial_data = {
+                    "bacteria": [
+                        {
+                            "id": bacterium_id,
+                            "position": {"x": pos.x, "y": pos.y},
+                            "resistance_status": "resistant" if np.random.random() > post_mutation_resistance else "sensitive",
+                            "fitness": float(fitness_scores[i] if i < len(fitness_scores) else 0.5),
+                            "generation": sim_data["current_generation"]
+                        }
+                        for i, (bacterium_id, pos) in enumerate(list(bacterium_positions.items())[:population.size])
+                    ],
+                    "antibiotic_zones": [
+                        {
+                            "id": f"zone_{i}",
+                            "center": {"x": zone[0], "y": zone[1]},
+                            "radius": zone[2],
+                            "concentration": zone[3]
+                        }
+                        for i, zone in enumerate(getattr(spatial_grid, 'antibiotic_zones', []))
+                    ],
+                    "grid_statistics": grid_stats,
+                    "timestamp": datetime.utcnow().timestamp()
+                }
+                
                 # Update state manager with progress
                 state_manager.update_simulation_state(
                     simulation_id,
@@ -259,7 +343,8 @@ class SimulationService:
                     "average_fitness": float(np.mean(fitness_scores)),
                     "diversity_index": diversity,
                     "generation_time": generation_time,
-                    "mutations_this_generation": len(mutation_events)
+                    "mutations_this_generation": len(mutation_events),
+                    "spatial_data": spatial_data
                 }
                 
                 # Notify callbacks and yield progress
