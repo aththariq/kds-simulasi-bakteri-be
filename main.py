@@ -15,6 +15,7 @@ from routes.websocket import router as websocket_router
 from routes.state import router as state_router
 from routes.performance import router as performance_router
 from routes.results import router as results_router
+from routes.websocket_optimization import router as websocket_optimization_router
 from utils.data_transform import DataTransformer, ResponseBuilder
 
 # Configure logging
@@ -100,6 +101,7 @@ app.include_router(websocket_router)
 app.include_router(state_router)
 app.include_router(performance_router)
 app.include_router(results_router)
+app.include_router(websocket_optimization_router)
 
 @app.get("/", tags=["Root"])
 async def root():
@@ -113,13 +115,19 @@ async def root():
             "redoc_url": "/redoc",
             "websocket_endpoints": {
                 "simulation": "/ws/simulation",
-                "global": "/ws/global"
+                "global": "/ws/global",
+                "performance": "/ws/performance"
             },
             "performance_endpoints": {
                 "metrics": "/api/performance/metrics",
                 "memory": "/api/performance/memory",
                 "benchmark": "/api/performance/benchmark/load-test",
                 "health": "/api/performance/health"
+            },
+            "websocket_optimization_endpoints": {
+                "stats": "/websocket-optimization/stats",
+                "health": "/websocket-optimization/health",
+                "benchmark": "/websocket-optimization/benchmark"
             },
             "results_endpoints": {
                 "health": "/api/results/health",

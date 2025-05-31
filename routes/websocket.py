@@ -10,7 +10,7 @@ import uuid
 import asyncio
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from enum import Enum
 
@@ -18,6 +18,10 @@ from services.simulation_service import SimulationService
 from services.reconnection_service import get_reconnection_manager, ReconnectionState
 from services.websocket_error_handler import WebSocketErrorHandler, ErrorCode, ErrorSeverity, ErrorCategory
 from utils.auth import verify_api_key_websocket
+from services.websocket_optimizations import (
+    get_optimized_websocket_service,
+    MessageOptimizationLevel
+)
 
 router = APIRouter(prefix="/ws", tags=["WebSocket"])
 logger = logging.getLogger(__name__)
@@ -521,71 +525,124 @@ async def simulation_websocket_endpoint(
     websocket: WebSocket,
     client_id: Optional[str] = Query(None, description="Optional client ID for reconnection")
 ):
-    """
-    Enhanced WebSocket endpoint for real-time simulation updates.
-    
-    Connection lifecycle:
-    1. WebSocket handshake and connection establishment
-    2. Optional authentication with API key
-    3. Subscription management for simulation updates
-    4. Real-time data streaming
-    5. Graceful disconnection handling
-    
-    Message protocol supports:
-    - Authentication: {"type": "auth_request", "data": {"api_key": "..."}}
-    - Subscription: {"type": "subscribe", "simulation_id": "uuid-here"}
-    - Unsubscription: {"type": "unsubscribe", "simulation_id": "uuid-here"}
-    - Heartbeat response: {"type": "pong"}
-    """
-    
-    # Establish connection
-    client_id = await manager.connect(websocket, client_id)
-    
+    """Enhanced WebSocket endpoint for simulation data with optimization support."""
     try:
-        while True:
-            # Receive message from client
-            start_time = time.time()
-            raw_data = await websocket.receive_text()
-            
+        # Connect with optimization support
+        final_client_id = await manager.connect(websocket, client_id)
+        optimization_service = get_optimized_websocket_service()
+        
+        # Set default optimization level for new clients
+        optimization_service.set_client_optimization_level(
+            final_client_id, 
+            MessageOptimizationLevel.COMPRESSED
+        )
+        
+        logger.info(f"Client {final_client_id} connected to simulation WebSocket with optimization enabled")
+        
+        # Send connection confirmation with optimization info
+        connection_message = WebSocketMessage(
+            type=MessageType.CONNECTION_ESTABLISHED,
+            timestamp=datetime.now().isoformat(),
+            client_id=final_client_id,
+            data={
+                "server_info": {
+                    "version": "1.0",
+                    "supported_features": [
+                        "real_time_updates", 
+                        "heartbeat", 
+                        "reconnection",
+                        "optimization",
+                        "compression",
+                        "delta_updates"
+                    ],
+                    "optimization_enabled": optimization_service.optimization_enabled,
+                    "optimization_level": optimization_service.get_client_optimization_level(final_client_id).value
+                },
+                "client_id": final_client_id,
+                "reconnection_id": manager.reconnection_manager.generate_reconnection_id(final_client_id)
+            }
+        )
+        
+        # Send using optimized service
+        await optimization_service.send_optimized_message(
+            websocket, 
+            final_client_id, 
+            asdict(connection_message)
+        )
+        
+        # Start message handling loop
+        async for message in websocket.iter_text():
             try:
                 # Parse incoming message
-                message = WebSocketMessage.from_json(raw_data, client_id)
+                try:
+                    parsed_message = WebSocketMessage.from_json(message, final_client_id)
+                except Exception as parse_error:
+                    logger.error(f"Failed to parse message from {final_client_id}: {parse_error}")
+                    await manager.send_to_client(
+                        final_client_id,
+                        WebSocketMessage(
+                            type=MessageType.ERROR,
+                            timestamp=datetime.now().isoformat(),
+                            client_id=final_client_id,
+                            error=f"Invalid message format: {parse_error}"
+                        )
+                    )
+                    continue
                 
-                # Record latency for reconnection service
-                latency_ms = (time.time() - start_time) * 1000
-                manager.reconnection_manager.record_latency(latency_ms)
+                # Handle optimization-specific messages
+                if parsed_message.type == MessageType.SYSTEM_STATUS and parsed_message.data:
+                    if parsed_message.data.get('action') == 'set_optimization_level':
+                        level_str = parsed_message.data.get('level', 'compressed')
+                        try:
+                            level = MessageOptimizationLevel(level_str)
+                            optimization_service.set_client_optimization_level(final_client_id, level)
+                            
+                            # Confirm optimization level change
+                            response = WebSocketMessage(
+                                type=MessageType.SYSTEM_STATUS,
+                                timestamp=datetime.now().isoformat(),
+                                client_id=final_client_id,
+                                data={
+                                    "action": "optimization_level_updated",
+                                    "level": level.value,
+                                    "message": f"Optimization level set to {level.value}"
+                                }
+                            )
+                            await optimization_service.send_optimized_message(
+                                websocket,
+                                final_client_id,
+                                asdict(response)
+                            )
+                            continue
+                        except ValueError:
+                            logger.warning(f"Invalid optimization level requested: {level_str}")
                 
-                # Update client activity
-                if client_id in manager.active_connections:
-                    manager.active_connections[client_id].update_activity()
-                
-                # Handle different message types
-                await handle_websocket_message(client_id, message)
+                # Process regular messages
+                await handle_websocket_message(final_client_id, parsed_message)
                 
             except json.JSONDecodeError as e:
-                error_message = WebSocketMessage(
-                    type=MessageType.ERROR,
-                    timestamp=datetime.now().isoformat(),
-                    client_id=client_id,
-                    error=f"Invalid JSON format: {str(e)}"
+                logger.error(f"JSON decode error from {final_client_id}: {e}")
+                await manager.send_to_client(
+                    final_client_id,
+                    WebSocketMessage(
+                        type=MessageType.ERROR,
+                        timestamp=datetime.now().isoformat(),
+                        client_id=final_client_id,
+                        error="Invalid JSON format"
+                    )
                 )
-                await manager.send_to_client(client_id, error_message)
-                
             except Exception as e:
-                logger.error(f"Error handling message from client {client_id}: {e}")
-                error_message = WebSocketMessage(
-                    type=MessageType.ERROR,
-                    timestamp=datetime.now().isoformat(),
-                    client_id=client_id,
-                    error=f"Message processing error: {str(e)}"
-                )
-                await manager.send_to_client(client_id, error_message)
-                
+                logger.error(f"Error processing message from {final_client_id}: {e}")
+                await manager.error_handler.handle_websocket_error(final_client_id, e)
+    
     except WebSocketDisconnect:
-        await manager.disconnect(client_id, reason="client_disconnect")
+        logger.info(f"Client {final_client_id} disconnected")
+        await manager.disconnect(final_client_id, "client_disconnected")
+        optimization_service.cleanup_client(final_client_id)
     except Exception as e:
-        logger.error(f"Unexpected error in WebSocket connection {client_id}: {e}")
-        await manager.disconnect(client_id, reason="server_error")
+        logger.error(f"WebSocket error for client {final_client_id}: {e}")
+        await manager.error_handler.handle_websocket_error(final_client_id, e)
+        optimization_service.cleanup_client(final_client_id)
 
 
 async def handle_websocket_message(client_id: str, message: WebSocketMessage):
@@ -863,7 +920,308 @@ async def spatial_websocket_endpoint(
         await manager.disconnect(client_id, reason="spatial_connection_error")
 
 
-# Helper function to get connection manager stats (for debugging/monitoring)
+@router.websocket("/performance")
+async def performance_websocket_endpoint(
+    websocket: WebSocket,
+    client_id: Optional[str] = Query(None, description="Optional client ID for reconnection")
+):
+    """WebSocket endpoint for real-time performance monitoring with optimization."""
+    manager = get_connection_manager()
+    optimization_service = get_optimized_websocket_service()
+    actual_client_id = await manager.connect(websocket, client_id)
+    
+    # Set performance monitoring optimization level
+    optimization_service.set_client_optimization_level(
+        actual_client_id, 
+        MessageOptimizationLevel.DELTA
+    )
+    
+    try:
+        # Import performance profiler
+        from utils.performance_profiler import get_profiler
+        profiler = get_profiler()
+        
+        logger.info(f"Performance monitoring client {actual_client_id} connected with optimization")
+        
+        # Send initial connection message with optimization info
+        welcome_message = WebSocketMessage(
+            type=MessageType.CONNECTION_ESTABLISHED,
+            timestamp=datetime.now().isoformat(),
+            client_id=actual_client_id,
+            data={
+                "message": "Connected to performance monitoring",
+                "optimization_enabled": optimization_service.optimization_enabled,
+                "optimization_level": optimization_service.get_client_optimization_level(actual_client_id).value,
+                "features": [
+                    "real_time_system_metrics",
+                    "function_performance_tracking", 
+                    "performance_alerts",
+                    "baseline_notifications",
+                    "optimized_transmission",
+                    "delta_compression"
+                ]
+            }
+        )
+        
+        # Send using optimized service
+        await optimization_service.send_optimized_message(
+            websocket, 
+            actual_client_id, 
+            asdict(welcome_message)
+        )
+        
+        # Register WebSocket callback with profiler
+        async def performance_callback(message: Dict[str, Any]):
+            """Callback for performance updates with optimization."""
+            try:
+                perf_message = WebSocketMessage(
+                    type=MessageType.PERFORMANCE_UPDATE,
+                    timestamp=datetime.now().isoformat(),
+                    client_id=actual_client_id,
+                    data=message
+                )
+                
+                # Use delta compression for performance updates
+                await optimization_service.send_optimized_message(
+                    websocket,
+                    actual_client_id,
+                    asdict(perf_message),
+                    use_delta=True,
+                    use_batching=False
+                )
+            except Exception as e:
+                logger.error(f"Failed to send performance update: {e}")
+        
+        # Subscribe to performance updates
+        profiler.subscribe_websocket(performance_callback)
+        
+        # Start task for periodic system metrics
+        async def send_system_metrics():
+            """Send periodic system metrics updates with optimization."""
+            while True:
+                try:
+                    # Get recent system metrics
+                    system_metrics = profiler.realtime_collector.get_recent_metrics(1)
+                    if system_metrics:
+                        metrics_message = WebSocketMessage(
+                            type=MessageType.PERFORMANCE_UPDATE,
+                            timestamp=datetime.now().isoformat(),
+                            client_id=actual_client_id,
+                            data={
+                                "type": "system_metrics",
+                                "metrics": system_metrics[0]
+                            }
+                        )
+                        
+                        # Use delta compression for frequent metrics
+                        await optimization_service.send_optimized_message(
+                            websocket,
+                            actual_client_id,
+                            asdict(metrics_message),
+                            use_delta=True
+                        )
+                    
+                    # Send performance summary every 10 seconds
+                    await asyncio.sleep(10)
+                    
+                    # Get performance summary
+                    summary = profiler.get_performance_summary()
+                    summary_message = WebSocketMessage(
+                        type=MessageType.PERFORMANCE_UPDATE,
+                        timestamp=datetime.now().isoformat(),
+                        client_id=actual_client_id,
+                        simulation_id="performance_monitoring",
+                        data={
+                            "type": "performance_summary",
+                            "summary": summary
+                        }
+                    )
+                    
+                    # Use delta compression for summary updates
+                    await optimization_service.send_optimized_message(
+                        websocket,
+                        actual_client_id,
+                        asdict(summary_message),
+                        use_delta=True
+                    )
+                    
+                    await asyncio.sleep(20)  # 30 second total interval
+                    
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Error sending system metrics: {e}")
+                    await asyncio.sleep(5)
+        
+        # Start system metrics task
+        metrics_task = asyncio.create_task(send_system_metrics())
+        
+        # Listen for client messages
+        try:
+            while True:
+                data = await websocket.receive_text()
+                
+                try:
+                    # Check if it's a binary message with optimization
+                    if data.startswith('WSOP'):
+                        # This would be a binary optimized message
+                        # For now, we'll handle text messages only
+                        logger.debug(f"Received potential binary message from {actual_client_id}")
+                        continue
+                    
+                    message = WebSocketMessage.from_json(data, actual_client_id)
+                    logger.debug(f"Performance monitoring message from {actual_client_id}: {message.type}")
+                    
+                    # Handle optimization control messages
+                    if message.type == MessageType.SYSTEM_STATUS and message.data:
+                        action = message.data.get('action')
+                        
+                        if action == 'set_optimization_level':
+                            level_str = message.data.get('level', 'delta')
+                            try:
+                                level = MessageOptimizationLevel(level_str)
+                                optimization_service.set_client_optimization_level(actual_client_id, level)
+                                
+                                # Confirm change
+                                response = WebSocketMessage(
+                                    type=MessageType.SYSTEM_STATUS,
+                                    timestamp=datetime.now().isoformat(),
+                                    client_id=actual_client_id,
+                                    data={
+                                        "action": "optimization_level_updated",
+                                        "level": level.value,
+                                        "message": f"Performance monitoring optimization set to {level.value}"
+                                    }
+                                )
+                                await optimization_service.send_optimized_message(
+                                    websocket,
+                                    actual_client_id,
+                                    asdict(response)
+                                )
+                                continue
+                            except ValueError:
+                                logger.warning(f"Invalid optimization level: {level_str}")
+                        
+                        elif action == 'get_optimization_stats':
+                            # Send optimization statistics
+                            stats = optimization_service.get_performance_summary()
+                            response = WebSocketMessage(
+                                type=MessageType.PERFORMANCE_UPDATE,
+                                timestamp=datetime.now().isoformat(),
+                                client_id=actual_client_id,
+                                data={
+                                    "type": "optimization_stats",
+                                    "stats": stats
+                                }
+                            )
+                            await optimization_service.send_optimized_message(
+                                websocket,
+                                actual_client_id,
+                                asdict(response)
+                            )
+                            continue
+                    
+                    # Handle specific performance monitoring commands
+                    if message.type == MessageType.SUBSCRIBE and message.data:
+                        subscription_type = message.data.get("subscription_type")
+                        
+                        if subscription_type == "function_metrics":
+                            function_name = message.data.get("function_name")
+                            if function_name:
+                                # Send current metrics for the function
+                                if function_name in profiler.metrics_storage:
+                                    metrics = profiler.metrics_storage[function_name][-10:]  # Last 10 metrics
+                                    response = WebSocketMessage(
+                                        type=MessageType.PERFORMANCE_UPDATE,
+                                        timestamp=datetime.now().isoformat(),
+                                        client_id=actual_client_id,
+                                        data={
+                                            "type": "function_metrics",
+                                            "function_name": function_name,
+                                            "metrics": [m.to_dict() for m in metrics]
+                                        }
+                                    )
+                                    await optimization_service.send_optimized_message(
+                                        websocket,
+                                        actual_client_id,
+                                        asdict(response)
+                                    )
+                        
+                        elif subscription_type == "alerts":
+                            # Send recent alerts
+                            recent_alerts = [
+                                alert.to_dict() for alert in profiler.alerts
+                                if alert.timestamp > datetime.now() - timedelta(hours=24)
+                            ]
+                            response = WebSocketMessage(
+                                type=MessageType.PERFORMANCE_UPDATE,
+                                timestamp=datetime.now().isoformat(),
+                                client_id=actual_client_id,
+                                data={
+                                    "type": "recent_alerts",
+                                    "alerts": recent_alerts
+                                }
+                            )
+                            await optimization_service.send_optimized_message(
+                                websocket,
+                                actual_client_id,
+                                asdict(response)
+                            )
+                    
+                    elif message.type == MessageType.PING:
+                        # Respond to ping
+                        pong_message = WebSocketMessage(
+                            type=MessageType.PONG,
+                            timestamp=datetime.now().isoformat(),
+                            client_id=actual_client_id
+                        )
+                        await optimization_service.send_optimized_message(
+                            websocket,
+                            actual_client_id,
+                            asdict(pong_message)
+                        )
+                        
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error from performance client {actual_client_id}: {e}")
+                    error_message = WebSocketMessage(
+                        type=MessageType.ERROR,
+                        timestamp=datetime.now().isoformat(),
+                        client_id=actual_client_id,
+                        error="Invalid JSON format"
+                    )
+                    await optimization_service.send_optimized_message(
+                        websocket,
+                        actual_client_id,
+                        asdict(error_message)
+                    )
+                except Exception as e:
+                    logger.error(f"Error processing performance monitoring message: {e}")
+                    await manager.error_handler.handle_websocket_error(actual_client_id, e)
+        
+        finally:
+            # Clean up
+            metrics_task.cancel()
+            try:
+                await metrics_task
+            except asyncio.CancelledError:
+                pass
+            
+            # Unsubscribe from profiler
+            try:
+                profiler.unsubscribe_websocket(performance_callback)
+            except Exception as e:
+                logger.error(f"Error unsubscribing from profiler: {e}")
+        
+    except WebSocketDisconnect:
+        logger.info(f"Performance monitoring client {actual_client_id} disconnected")
+        await manager.disconnect(actual_client_id, "performance_client_disconnect")
+        optimization_service.cleanup_client(actual_client_id)
+    except Exception as e:
+        logger.error(f"Error in performance monitoring WebSocket for {actual_client_id}: {e}")
+        await manager.error_handler.handle_websocket_error(actual_client_id, e)
+        optimization_service.cleanup_client(actual_client_id)
+
+
 def get_connection_manager() -> EnhancedConnectionManager:
     """Get the global connection manager instance."""
     return manager 

@@ -1,12 +1,13 @@
 """
-Population class for managing collections of bacteria.
+Population class for managing collections of bacteria with performance optimizations.
 """
 
 import random
 import uuid
-from typing import List, Dict, Optional, Tuple, Callable, Any
+from typing import List, Dict, Optional, Tuple, Callable, Any, Set
 from dataclasses import dataclass, field
 import numpy as np
+from collections import defaultdict
 
 from .bacterium import Bacterium, ResistanceStatus, Position
 
@@ -52,6 +53,10 @@ class PopulationConfig:
     # Age distribution
     initial_age_range: Tuple[int, int] = (0, 3)
     
+    # Performance optimization flags
+    enable_optimizations: bool = True
+    batch_size: int = 1000  # Size for batch operations
+    
     def __post_init__(self):
         """Validate configuration parameters."""
         if self.population_size < 0:
@@ -62,38 +67,54 @@ class PopulationConfig:
             raise ValueError("Grid dimensions must be positive")
 
 
-class Population:
+class OptimizedPopulation:
     """
-    Manages a population of bacteria with spatial and non-spatial support.
+    High-performance population manager with optimized data structures.
     
-    Provides methods for initialization, tracking, modification, and analysis
-    of bacterial populations in evolution simulations.
+    Uses indexed collections for O(1) lookups and incremental statistics
+    for better performance with large bacterial populations.
     """
     
     def __init__(self, config: PopulationConfig):
         """
-        Initialize population manager.
+        Initialize optimized population manager.
         
         Args:
             config: Population configuration parameters
         """
         self.config = config
-        self.bacteria: List[Bacterium] = []
         self.generation = 0
         self._next_id = 0
         
-        # Spatial tracking (if enabled)
-        self.spatial_grid: Optional[Dict[Tuple[int, int], List[Bacterium]]] = None
-        if config.use_spatial:
-            self.spatial_grid = {}
+        # OPTIMIZATION: Use indexed collections instead of lists
+        self.bacteria_by_id: Dict[str, Bacterium] = {}  # O(1) lookup by ID
+        self.resistant_bacteria: Set[str] = set()  # O(1) resistance filtering
+        self.sensitive_bacteria: Set[str] = set()  # O(1) sensitivity filtering
         
-        # Statistics tracking
+        # Spatial indexing (if enabled)
+        self.spatial_grid: Optional[Dict[Tuple[int, int], Set[str]]] = None
+        self.position_index: Dict[str, Position] = {}  # O(1) position lookup
+        if config.use_spatial:
+            self.spatial_grid = defaultdict(set)
+        
+        # OPTIMIZATION: Incremental statistics tracking
+        self._cached_stats = PopulationStats()
+        self._stats_dirty = True
         self.stats_history: List[PopulationStats] = []
+        
+        # Performance tracking
+        self._operation_count = 0
+        self._batch_updates_pending = []
         
         # Set random seed if provided
         if config.random_seed is not None:
             random.seed(config.random_seed)
             np.random.seed(config.random_seed)
+    
+    @property
+    def bacteria(self) -> List[Bacterium]:
+        """Get all bacteria as list (for backward compatibility)."""
+        return list(self.bacteria_by_id.values())
     
     def _generate_id(self) -> str:
         """Generate unique bacterium ID."""
@@ -104,9 +125,7 @@ class Population:
         """
         Create initial population of bacteria according to configuration.
         """
-        self.bacteria.clear()
-        if self.spatial_grid:
-            self.spatial_grid.clear()
+        self.clear()
         
         # Handle empty population case
         if self.config.population_size == 0:
@@ -118,24 +137,55 @@ class Population:
         num_resistant = int(self.config.population_size * self.config.initial_resistance_frequency)
         num_sensitive = self.config.population_size - num_resistant
         
+        # OPTIMIZATION: Batch create bacteria to reduce overhead
+        bacteria_to_add = []
+        
         # Create sensitive bacteria
         for _ in range(num_sensitive):
             bacterium = self._create_bacterium(ResistanceStatus.SENSITIVE)
-            self.add_bacterium(bacterium)
+            bacteria_to_add.append(bacterium)
         
         # Create resistant bacteria  
         for _ in range(num_resistant):
             bacterium = self._create_bacterium(ResistanceStatus.RESISTANT)
-            self.add_bacterium(bacterium)
+            bacteria_to_add.append(bacterium)
         
         # Shuffle to randomize positions
-        random.shuffle(self.bacteria)
+        random.shuffle(bacteria_to_add)
+        
+        # Batch add all bacteria
+        self._batch_add_bacteria(bacteria_to_add)
         
         # Update statistics
         self._update_statistics()
         
-        print(f"✅ Initialized population: {self.config.population_size} bacteria "
+        print(f"✅ Initialized optimized population: {self.config.population_size} bacteria "
               f"({num_resistant} resistant, {num_sensitive} sensitive)")
+    
+    def _batch_add_bacteria(self, bacteria_list: List[Bacterium]) -> None:
+        """
+        Add multiple bacteria efficiently in batch operation.
+        
+        Args:
+            bacteria_list: List of bacteria to add
+        """
+        for bacterium in bacteria_list:
+            # Add to main index
+            self.bacteria_by_id[bacterium.id] = bacterium
+            
+            # Add to resistance index
+            if bacterium.is_resistant:
+                self.resistant_bacteria.add(bacterium.id)
+            else:
+                self.sensitive_bacteria.add(bacterium.id)
+            
+            # Add to spatial index if applicable
+            if self.config.use_spatial and bacterium.position:
+                pos_key = (bacterium.position.x, bacterium.position.y)
+                self.spatial_grid[pos_key].add(bacterium.id)
+                self.position_index[bacterium.id] = bacterium.position
+        
+        self._stats_dirty = True
     
     def _create_bacterium(self, resistance_status: ResistanceStatus) -> Bacterium:
         """
@@ -177,7 +227,7 @@ class Population:
     
     def _find_available_position(self) -> Position:
         """
-        Find an available position in the spatial grid.
+        Find an available position in the spatial grid using object pool.
         
         Returns:
             Available Position
@@ -188,7 +238,7 @@ class Population:
         while attempts < max_attempts:
             x = random.randint(0, self.config.grid_width - 1)
             y = random.randint(0, self.config.grid_height - 1)
-            position = Position(x, y)
+            position = Position.create(x, y)
             
             # Check if position is available
             if self._is_position_available(position):
@@ -199,7 +249,7 @@ class Population:
         # If no position found after many attempts, allow overcrowding
         x = random.randint(0, self.config.grid_width - 1)
         y = random.randint(0, self.config.grid_height - 1)
-        return Position(x, y)
+        return Position.create(x, y)
     
     def _is_position_available(self, position: Position) -> bool:
         """
@@ -215,12 +265,12 @@ class Population:
             return True
         
         grid_key = (position.x, position.y)
-        bacteria_at_position = self.spatial_grid.get(grid_key, [])
+        bacteria_at_position = self.spatial_grid.get(grid_key, set())
         return len(bacteria_at_position) < self.config.max_bacteria_per_cell
     
     def add_bacterium(self, bacterium: Bacterium) -> bool:
         """
-        Add a bacterium to the population.
+        Add a bacterium to the population with optimized indexing.
         
         Args:
             bacterium: Bacterium to add
@@ -228,21 +278,29 @@ class Population:
         Returns:
             True if successfully added
         """
-        # Add to main list
-        self.bacteria.append(bacterium)
+        # Add to main index
+        self.bacteria_by_id[bacterium.id] = bacterium
+        
+        # Update resistance indices
+        if bacterium.is_resistant:
+            self.resistant_bacteria.add(bacterium.id)
+        else:
+            self.sensitive_bacteria.add(bacterium.id)
         
         # Add to spatial grid if applicable
         if self.spatial_grid is not None and bacterium.position:
             grid_key = (bacterium.position.x, bacterium.position.y)
-            if grid_key not in self.spatial_grid:
-                self.spatial_grid[grid_key] = []
-            self.spatial_grid[grid_key].append(bacterium)
+            self.spatial_grid[grid_key].add(bacterium.id)
+            self.position_index[bacterium.id] = bacterium.position
+        
+        # Mark stats as dirty for incremental update
+        self._stats_dirty = True
         
         return True
     
     def remove_bacterium(self, bacterium: Bacterium) -> bool:
         """
-        Remove a bacterium from the population.
+        Remove a bacterium from the population with optimized cleanup.
         
         Args:
             bacterium: Bacterium to remove
@@ -251,21 +309,40 @@ class Population:
             True if successfully removed
         """
         try:
-            # Remove from main list
-            self.bacteria.remove(bacterium)
+            # Remove from main index
+            del self.bacteria_by_id[bacterium.id]
             
-            # Remove from spatial grid if applicable
+            # Remove from resistance indices
+            self.resistant_bacteria.discard(bacterium.id)
+            self.sensitive_bacteria.discard(bacterium.id)
+            
+            # Remove from spatial indices if applicable
             if self.spatial_grid is not None and bacterium.position:
                 grid_key = (bacterium.position.x, bacterium.position.y)
                 if grid_key in self.spatial_grid:
-                    if bacterium in self.spatial_grid[grid_key]:
-                        self.spatial_grid[grid_key].remove(bacterium)
-                    if not self.spatial_grid[grid_key]:  # Remove empty lists
+                    self.spatial_grid[grid_key].discard(bacterium.id)
+                    if not self.spatial_grid[grid_key]:
                         del self.spatial_grid[grid_key]
+                
+                # Remove from position index
+                self.position_index.pop(bacterium.id, None)
+            
+            # Mark stats as dirty for incremental update
+            self._stats_dirty = True
             
             return True
-        except ValueError:
+        except KeyError:
             return False
+    
+    def clear(self) -> None:
+        """Clear all data structures efficiently."""
+        self.bacteria_by_id.clear()
+        self.resistant_bacteria.clear()
+        self.sensitive_bacteria.clear()
+        if self.spatial_grid:
+            self.spatial_grid.clear()
+        self.position_index.clear()
+        self._stats_dirty = True
     
     def get_bacteria_at_position(self, position: Position) -> List[Bacterium]:
         """
@@ -281,7 +358,7 @@ class Population:
             return []
         
         grid_key = (position.x, position.y)
-        return self.spatial_grid.get(grid_key, []).copy()
+        return [self.bacteria_by_id[id] for id in self.spatial_grid.get(grid_key, set())]
     
     def get_neighbors(self, bacterium: Bacterium, radius: float = 1.0) -> List[Bacterium]:
         """
@@ -318,20 +395,40 @@ class Population:
     
     def get_statistics(self) -> PopulationStats:
         """
-        Calculate current population statistics.
+        Get current population statistics (cached for performance).
         
         Returns:
             PopulationStats object with current metrics
         """
-        if not self.bacteria:
-            return PopulationStats()
+        if self._stats_dirty:
+            self._cached_stats = self._calculate_fresh_statistics()
+            self._stats_dirty = False
         
-        total_count = len(self.bacteria)
-        resistant_count = sum(1 for b in self.bacteria if b.is_resistant)
-        sensitive_count = total_count - resistant_count
+        return self._cached_stats
+    
+    def _update_statistics(self) -> None:
+        """Update and store population statistics using incremental approach."""
+        if self._stats_dirty:
+            self._cached_stats = self._calculate_fresh_statistics()
+            self._stats_dirty = False
         
-        average_age = sum(b.age for b in self.bacteria) / total_count
-        average_fitness = sum(b.effective_fitness for b in self.bacteria) / total_count
+        self.stats_history.append(self._cached_stats)
+    
+    def _calculate_fresh_statistics(self) -> PopulationStats:
+        """Calculate statistics from scratch when needed."""
+        if not self.bacteria_by_id:
+            return PopulationStats(generation=self.generation)
+        
+        total_count = len(self.bacteria_by_id)
+        resistant_count = len(self.resistant_bacteria)
+        sensitive_count = len(self.sensitive_bacteria)
+        
+        # Calculate averages efficiently
+        total_age = sum(b.age for b in self.bacteria_by_id.values())
+        total_fitness = sum(b.effective_fitness for b in self.bacteria_by_id.values())
+        
+        average_age = total_age / total_count
+        average_fitness = total_fitness / total_count
         resistance_frequency = resistant_count / total_count if total_count > 0 else 0.0
         
         return PopulationStats(
@@ -344,81 +441,69 @@ class Population:
             generation=self.generation
         )
     
-    def _update_statistics(self) -> None:
-        """Update and store population statistics."""
-        stats = self.get_statistics()
-        self.stats_history.append(stats)
-    
     def advance_generation(self) -> None:
         """
-        Advance the simulation by one generation.
-
-        This involves:
-        1. Aging all bacteria.
-        2. Determining survival based on individual probabilities.
-        3. Updating population statistics.
+        Advance the population by one generation with optimized operations.
         """
         self.generation += 1
         
-        survivors: List[Bacterium] = []
-        for bacterium in self.bacteria:
-            # Placeholder for antibiotic concentration and environmental stress
-            # These should eventually be configurable or dynamic
-            antibiotic_concentration = 0.0 
-            environmental_stress = 0.0
-            resistance_cost = 0.1 # Example cost, should be configurable
-
-            survival_prob = bacterium.calculate_survival_probability(
-                antibiotic_concentration=antibiotic_concentration,
-                resistance_cost=resistance_cost,
-                environmental_stress=environmental_stress
-            )
-            
-            if random.random() < survival_prob:
-                bacterium.age_one_generation()
-                survivors.append(bacterium)
+        # OPTIMIZATION: Batch process survival and reproduction
+        survivors = []
+        new_offspring = []
         
-        self.bacteria = survivors
+        # Process in batches to reduce memory pressure
+        bacteria_list = list(self.bacteria_by_id.values())
+        batch_size = self.config.batch_size
         
-        # Reproduction step
-        offspring_list: List[Bacterium] = []
-        for parent in self.bacteria: # Iterate over survivors
-            # Placeholder for mutation rate, should be configurable
-            mutation_rate = 0.001 
-            # Placeholder for resource availability, should be dynamic or configurable
-            resource_availability = 1.0 
-
-            if parent.can_reproduce(resource_availability=resource_availability):
-                offspring = parent.reproduce(
-                    mutation_rate=mutation_rate,
-                    generation=self.generation,
-                    next_id_generator=self._generate_id # Pass the ID generator
-                )
-                if offspring:
-                    offspring_list.append(offspring)
-
-        # Add offspring to the population and spatial grid
-        for child in offspring_list:
-            self.add_bacterium(child) # This method handles spatial grid update
-
-        # Update spatial grid if enabled - This part might be redundant if add_bacterium handles it
-        # Re-check add_bacterium implementation. For now, let's assume add_bacterium handles it.
-        # if self.config.use_spatial and self.spatial_grid is not None:
-        #     self.spatial_grid.clear()
-        #     for bacterium_item in self.bacteria: # self.bacteria now includes offspring
-        #         if bacterium_item.position:
-        #             pos_tuple = (bacterium_item.position.x, bacterium_item.position.y)
-        #             if pos_tuple not in self.spatial_grid:
-        #                 self.spatial_grid[pos_tuple] = []
-        #             if len(self.spatial_grid[pos_tuple]) < self.config.max_bacteria_per_cell:
-        #                 self.spatial_grid[pos_tuple].append(bacterium_item)
-
+        for i in range(0, len(bacteria_list), batch_size):
+            batch = bacteria_list[i:i + batch_size]
+            batch_survivors, batch_offspring = self._process_generation_batch(batch)
+            survivors.extend(batch_survivors)
+            new_offspring.extend(batch_offspring)
+        
+        # Clear current population
+        self.clear()
+        
+        # Add survivors and offspring
+        all_bacteria = survivors + new_offspring
+        self._batch_add_bacteria(all_bacteria)
+        
+        # Update statistics
         self._update_statistics()
-        print(f"Advanced to generation {self.generation}. Survivors: {len(survivors)}, Offspring: {len(offspring_list)}, Total: {len(self.bacteria)}")
+    
+    def _process_generation_batch(self, bacteria_batch: List[Bacterium]) -> Tuple[List[Bacterium], List[Bacterium]]:
+        """
+        Process a batch of bacteria for survival and reproduction.
+        
+        Args:
+            bacteria_batch: Batch of bacteria to process
+            
+        Returns:
+            Tuple of (survivors, offspring)
+        """
+        survivors = []
+        offspring = []
+        
+        for bacterium in bacteria_batch:
+            # Age the bacterium
+            bacterium.age_one_generation()
+            
+            # Check survival
+            survival_prob = bacterium.calculate_survival_probability()
+            if random.random() < survival_prob:
+                survivors.append(bacterium)
+                
+                # Check reproduction
+                if bacterium.can_reproduce():
+                    child = bacterium.reproduce(generation=self.generation, next_id_generator=self._generate_id)
+                    if child:
+                        offspring.append(child)
+        
+        return survivors, offspring
     
     def get_random_sample(self, sample_size: int) -> List[Bacterium]:
         """
-        Get a random sample of bacteria from the population.
+        Get a random sample of bacteria efficiently.
         
         Args:
             sample_size: Number of bacteria to sample
@@ -426,142 +511,149 @@ class Population:
         Returns:
             Random sample of bacteria
         """
-        if sample_size >= len(self.bacteria):
-            return self.bacteria.copy()
+        if sample_size >= len(self.bacteria_by_id):
+            return list(self.bacteria_by_id.values())
         
-        return random.sample(self.bacteria, sample_size)
+        # OPTIMIZATION: Sample IDs first, then lookup
+        sampled_ids = random.sample(list(self.bacteria_by_id.keys()), sample_size)
+        return [self.bacteria_by_id[id] for id in sampled_ids]
     
     def filter_bacteria(self, predicate: Callable[[Bacterium], bool]) -> List[Bacterium]:
         """
-        Filter bacteria based on a predicate function.
+        Filter bacteria using a predicate function efficiently.
         
         Args:
-            predicate: Function that returns True for bacteria to include
+            predicate: Function to test each bacterium
             
         Returns:
             List of bacteria matching the predicate
         """
-        return [b for b in self.bacteria if predicate(b)]
+        return [bacterium for bacterium in self.bacteria_by_id.values() if predicate(bacterium)]
     
     def get_resistant_bacteria(self) -> List[Bacterium]:
-        """Get all resistant bacteria."""
-        return self.filter_bacteria(lambda b: b.is_resistant)
+        """Get all resistant bacteria using optimized index."""
+        return [self.bacteria_by_id[id] for id in self.resistant_bacteria]
     
     def get_sensitive_bacteria(self) -> List[Bacterium]:
-        """Get all sensitive bacteria."""
-        return self.filter_bacteria(lambda b: not b.is_resistant)
+        """Get all sensitive bacteria using optimized index."""
+        return [self.bacteria_by_id[id] for id in self.sensitive_bacteria]
     
     def get_reproducible_bacteria(self) -> List[Bacterium]:
-        """Get bacteria that can reproduce."""
-        return self.filter_bacteria(lambda b: b.can_reproduce())
+        """Get bacteria that can reproduce with optimized filtering."""
+        return [bacterium for bacterium in self.bacteria_by_id.values() if bacterium.can_reproduce()]
     
     def clone_bacterium(self, bacterium: Bacterium) -> Bacterium:
         """
-        Create a clone of a bacterium with a new ID.
+        Create an exact copy of a bacterium with new ID.
         
         Args:
             bacterium: Bacterium to clone
             
         Returns:
-            Cloned bacterium
+            Cloned bacterium with new ID
         """
-        position = None
+        # Find position for clone
+        clone_position = None
         if bacterium.position and self.config.use_spatial:
-            position = self._find_available_position()
+            clone_position = self._find_available_position()
         
         clone = Bacterium(
             id=self._generate_id(),
             resistance_status=bacterium.resistance_status,
             age=bacterium.age,
             fitness=bacterium.fitness,
-            position=position,
-            generation_born=self.generation,
+            position=clone_position,
+            generation_born=bacterium.generation_born,
             parent_id=bacterium.id
         )
         
         return clone
     
     def reset_population(self) -> None:
-        """Reset population to empty state."""
-        self.bacteria.clear()
-        if self.spatial_grid:
-            self.spatial_grid.clear()
-        self.stats_history.clear()
+        """Reset population to empty state efficiently."""
+        self.clear()
         self.generation = 0
         self._next_id = 0
+        self.stats_history.clear()
     
     def reset(self) -> None:
-        """Alias for reset_population() for compatibility."""
+        """Reset everything to initial state."""
         self.reset_population()
-        # Re-initialize the population with original config
-        self.initialize_population()
     
     def export_population_data(self) -> Dict[str, Any]:
         """
-        Export population data for analysis or saving.
+        Export population data for analysis with optimized serialization.
         
         Returns:
             Dictionary containing population data
         """
+        stats = self.get_statistics()
+        
         return {
-            'generation': self.generation,
-            'current_population_size': len(self.bacteria),
-            'config': {
-                'population_size': self.config.population_size,
-                'initial_resistance_frequency': self.config.initial_resistance_frequency,
-                'use_spatial': self.config.use_spatial,
-                'grid_dimensions': (self.config.grid_width, self.config.grid_height),
+            "metadata": {
+                "generation": self.generation,
+                "population_size": len(self.bacteria_by_id),
+                "config": {
+                    "population_size": self.config.population_size,
+                    "grid_width": self.config.grid_width,
+                    "grid_height": self.config.grid_height,
+                    "use_spatial": self.config.use_spatial
+                }
             },
-            'stats_history': [
+            "statistics": {
+                "total_count": stats.total_count,
+                "resistant_count": stats.resistant_count,
+                "sensitive_count": stats.sensitive_count,
+                "average_age": stats.average_age,
+                "average_fitness": stats.average_fitness,
+                "resistance_frequency": stats.resistance_frequency
+            },
+            "bacteria": [
                 {
-                    'generation': stats.generation,
-                    'total_count': stats.total_count,
-                    'resistant_count': stats.resistant_count,
-                    'resistance_frequency': stats.resistance_frequency,
-                    'average_fitness': stats.average_fitness,
-                    'average_age': stats.average_age,
+                    "id": bacterium.id,
+                    "resistance_status": bacterium.resistance_status.value,
+                    "age": bacterium.age,
+                    "fitness": bacterium.fitness,
+                    "position": {
+                        "x": bacterium.position.x,
+                        "y": bacterium.position.y
+                    } if bacterium.position else None,
+                    "generation_born": bacterium.generation_born
                 }
-                for stats in self.stats_history
-            ],
-            'bacteria_data': [
-                {
-                    'id': b.id,
-                    'is_resistant': b.is_resistant,
-                    'age': b.age,
-                    'fitness': b.fitness,
-                    'position': (b.position.x, b.position.y) if b.position else None,
-                }
-                for b in self.bacteria
+                for bacterium in self.bacteria_by_id.values()
             ]
         }
     
     @property
     def size(self) -> int:
-        """Get current population size."""
-        return len(self.bacteria)
+        """Get population size efficiently."""
+        return len(self.bacteria_by_id)
     
     @property
     def resistance_frequency(self) -> float:
-        """Get current resistance frequency."""
-        if not self.bacteria:
-            return 0.0
-        return sum(1 for b in self.bacteria if b.is_resistant) / len(self.bacteria)
+        """Get resistance frequency efficiently using cached stats."""
+        return self.get_statistics().resistance_frequency
     
     def __len__(self) -> int:
-        """Support len() function."""
-        return len(self.bacteria)
+        """Get population size."""
+        return len(self.bacteria_by_id)
     
     def __iter__(self):
-        """Support iteration over bacteria."""
-        return iter(self.bacteria)
+        """Iterate over bacteria efficiently."""
+        return iter(self.bacteria_by_id.values())
     
     def __str__(self) -> str:
-        """String representation of population."""
+        """String representation with current stats."""
         stats = self.get_statistics()
-        return (f"Population(size={stats.total_count}, resistant={stats.resistant_count}, "
-                f"sensitive={stats.sensitive_count}, gen={self.generation})")
+        return (f"OptimizedPopulation(size={stats.total_count}, "
+                f"resistant={stats.resistant_count}, "
+                f"generation={self.generation})")
     
     def __repr__(self) -> str:
-        """Detailed representation of population."""
-        return (f"Population(size={len(self.bacteria)}, generation={self.generation}, "
-                f"spatial={'enabled' if self.config.use_spatial else 'disabled'})") 
+        """Detailed representation."""
+        return (f"OptimizedPopulation(config={self.config}, "
+                f"size={len(self.bacteria_by_id)}, generation={self.generation})")
+
+
+# Maintain backward compatibility
+Population = OptimizedPopulation 

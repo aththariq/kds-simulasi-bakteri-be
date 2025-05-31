@@ -2,10 +2,12 @@
 Bacterium class for individual bacterial cells in the simulation.
 """
 
-from typing import Optional, Tuple, Dict, TYPE_CHECKING
+from typing import Optional, Tuple, Dict, TYPE_CHECKING, Set
 import random
 from dataclasses import dataclass, field
 from enum import Enum
+import weakref
+from collections import deque
 
 if TYPE_CHECKING:
     from .mutation import MutationEngine
@@ -17,19 +19,94 @@ class ResistanceStatus(Enum):
     RESISTANT = "resistant"
 
 
+class PositionPool:
+    """Object pool for Position instances to reduce memory allocation overhead."""
+    
+    def __init__(self, max_pool_size: int = 1000):
+        self.max_pool_size = max_pool_size
+        self._pool: deque = deque()
+        self._active_positions: Set['Position'] = set()
+    
+    def get_position(self, x: int, y: int) -> 'Position':
+        """Get a Position object from pool or create new one."""
+        if self._pool:
+            position = self._pool.popleft()
+            position._reset(x, y)
+        else:
+            position = Position._create_pooled(x, y, self)
+        
+        self._active_positions.add(position)
+        return position
+    
+    def return_position(self, position: 'Position') -> None:
+        """Return a Position object to the pool."""
+        if position in self._active_positions:
+            self._active_positions.remove(position)
+            if len(self._pool) < self.max_pool_size:
+                self._pool.append(position)
+    
+    def clear_pool(self) -> None:
+        """Clear all pooled positions."""
+        self._pool.clear()
+        self._active_positions.clear()
+
+
+# Global position pool instance
+_position_pool = PositionPool()
+
+
 @dataclass
 class Position:
-    """2D position for spatial simulations."""
+    """2D position for spatial simulations with object pooling support."""
     x: int
     y: int
+    _pool: Optional[PositionPool] = field(default=None, init=False, repr=False)
+    
+    @classmethod
+    def create(cls, x: int, y: int) -> 'Position':
+        """Create a Position using object pool for efficiency."""
+        return _position_pool.get_position(x, y)
+    
+    @classmethod
+    def _create_pooled(cls, x: int, y: int, pool: PositionPool) -> 'Position':
+        """Internal method to create position with pool reference."""
+        position = cls(x, y)
+        position._pool = pool
+        return position
+    
+    def _reset(self, x: int, y: int) -> None:
+        """Reset position coordinates for reuse."""
+        self.x = x
+        self.y = y
     
     def distance_to(self, other: 'Position') -> float:
         """Calculate Euclidean distance to another position."""
         return ((self.x - other.x) ** 2 + (self.y - other.y) ** 2) ** 0.5
     
+    def manhattan_distance_to(self, other: 'Position') -> float:
+        """Calculate Manhattan distance to another position."""
+        return abs(self.x - other.x) + abs(self.y - other.y)
+    
     def is_adjacent(self, other: 'Position') -> bool:
         """Check if position is adjacent (8-neighborhood)."""
         return abs(self.x - other.x) <= 1 and abs(self.y - other.y) <= 1 and self != other
+    
+    def copy(self) -> 'Position':
+        """Create a copy of this position."""
+        return Position.create(self.x, self.y)
+    
+    def __del__(self):
+        """Return position to pool when object is deleted."""
+        if self._pool:
+            self._pool.return_position(self)
+    
+    def __hash__(self):
+        return hash((self.x, self.y))
+    
+    def __eq__(self, other):
+        if not isinstance(other, Position):
+            return False
+        return self.x == other.x and self.y == other.y
 
 
 @dataclass
@@ -214,17 +291,18 @@ class Bacterium:
         offspring_resistance = self.resistance_status
         offspring_fitness = self.fitness
         
-        # Create offspring near parent (for spatial simulations)
+        # OPTIMIZATION: Create offspring position using object pool
         offspring_position = None
         if self.position:
-            # Place offspring in adjacent cell
-            adjacent_positions = [
-                Position(self.position.x + dx, self.position.y + dy)
+            # Place offspring in adjacent cell using pooled positions
+            adjacent_coords = [
+                (self.position.x + dx, self.position.y + dy)
                 for dx in [-1, 0, 1]
                 for dy in [-1, 0, 1]
                 if not (dx == 0 and dy == 0)
             ]
-            offspring_position = random.choice(adjacent_positions)
+            coord_x, coord_y = random.choice(adjacent_coords)
+            offspring_position = Position.create(coord_x, coord_y)
         
         # Create offspring first
         offspring = Bacterium(

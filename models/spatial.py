@@ -7,17 +7,97 @@ for horizontal gene transfer (HGT) mechanisms.
 """
 
 import math
-import numpy as np
-from typing import List, Tuple, Dict, Set, Optional, Union
+import logging
+from typing import Dict, List, Optional, Set, Tuple, Union
 from dataclasses import dataclass, field
 from enum import Enum
-import logging
+import weakref
+import numpy as np
 import random
-from collections import defaultdict, deque
 import heapq
 from scipy.spatial import cKDTree  # Added for efficient spatial queries
 
+# Import memory management components with try/catch for flexibility
+try:
+    from services.memory_manager import MemoryManager, Disposable, ObjectPool
+except ImportError:
+    try:
+        from backend.services.memory_manager import MemoryManager, Disposable, ObjectPool
+    except ImportError:
+        # Fallback for testing - create minimal implementations
+        class Disposable:
+            def dispose(self): pass
+            @property
+            def is_disposed(self): return False
+        
+        class ObjectPool:
+            def __init__(self, factory, *args, **kwargs): 
+                self.factory = factory
+            def acquire(self): 
+                return self.factory()
+            def release(self, obj): pass
+            def clear(self): pass
+            def get_stats(self): return type('Stats', (), {'hit_rate': 0, 'current_pool_size': 0})()
+        
+        class MemoryManager:
+            def __init__(self): 
+                self.resource_manager = type('ResourceManager', (), {
+                    'register': lambda self, obj, group: None,
+                    'unregister': lambda self, obj: None
+                })()
+            def create_pool(self, name, factory, *args, **kwargs): 
+                return ObjectPool(factory, *args, **kwargs)
+            def get_pool(self, name): return None
+            def get_memory_metrics(self): 
+                return type('Metrics', (), {
+                    'rss_mb': 100, 'vms_mb': 200, 'heap_size_mb': 50, 
+                    'object_count': 1000, 'timestamp': type('datetime', (), {'isoformat': lambda: '2023-01-01'})()
+                })()
+            def get_pool_stats(self): return {}
+            def cleanup_all(self): return {}
+
 logger = logging.getLogger(__name__)
+
+# Global memory manager instance
+_memory_manager = MemoryManager()
+
+# Object pools for frequently created objects
+_coordinate_pool: Optional[ObjectPool] = None
+_grid_cell_pool: Optional[ObjectPool] = None
+
+
+def _reset_coordinate(coord: 'Coordinate') -> None:
+    """Reset function for coordinate pool."""
+    coord.x = 0.0
+    coord.y = 0.0
+
+
+def _reset_grid_cell(cell: 'GridCell') -> None:
+    """Reset function for grid cell pool."""
+    cell.bacteria_ids.clear()
+    cell.antibiotic_concentration = 0.0
+    cell.nutrient_concentration = 1.0
+
+
+def _initialize_pools():
+    """Initialize object pools for spatial components."""
+    global _coordinate_pool, _grid_cell_pool
+    
+    if _coordinate_pool is None:
+        _coordinate_pool = _memory_manager.create_pool(
+            name="coordinate_pool",
+            factory=lambda: Coordinate(0.0, 0.0),
+            reset_func=_reset_coordinate,
+            max_size=5000
+        )
+    
+    if _grid_cell_pool is None:
+        _grid_cell_pool = _memory_manager.create_pool(
+            name="grid_cell_pool", 
+            factory=lambda: GridCell(Coordinate(0.0, 0.0)),
+            reset_func=_reset_grid_cell,
+            max_size=10000
+        )
 
 
 class BoundaryCondition(Enum):
@@ -32,6 +112,20 @@ class Coordinate:
     """Represents a 2D coordinate in the spatial grid."""
     x: float
     y: float
+    
+    @classmethod
+    def create_pooled(cls, x: float, y: float) -> 'Coordinate':
+        """Create a coordinate using object pool for efficiency."""
+        _initialize_pools()
+        coord = _coordinate_pool.acquire()
+        coord.x = x
+        coord.y = y
+        return coord
+    
+    def release_to_pool(self) -> None:
+        """Return this coordinate to the object pool."""
+        if _coordinate_pool:
+            _coordinate_pool.release(self)
     
     def distance_to(self, other: 'Coordinate') -> float:
         """Calculate Euclidean distance to another coordinate."""
@@ -63,6 +157,22 @@ class GridCell:
     antibiotic_concentration: float = 0.0
     nutrient_concentration: float = 1.0
     
+    @classmethod
+    def create_pooled(cls, coordinate: Coordinate) -> 'GridCell':
+        """Create a grid cell using object pool for efficiency."""
+        _initialize_pools()
+        cell = _grid_cell_pool.acquire()
+        cell.coordinate = coordinate
+        cell.bacteria_ids.clear()
+        cell.antibiotic_concentration = 0.0
+        cell.nutrient_concentration = 1.0
+        return cell
+    
+    def release_to_pool(self) -> None:
+        """Return this grid cell to the object pool."""
+        if _grid_cell_pool:
+            _grid_cell_pool.release(self)
+    
     def add_bacterium(self, bacterium_id: str):
         """Add a bacterium to this cell."""
         self.bacteria_ids.add(bacterium_id)
@@ -80,12 +190,13 @@ class GridCell:
         return self.get_bacteria_count() > max_capacity
 
 
-class SpatialGrid:
+class SpatialGrid(Disposable):
     """
     2D spatial grid representing a Petri dish for bacterial simulation.
     
     Provides spatial positioning, neighborhood detection, and environmental
-    factor management (antibiotics, nutrients).
+    factor management (antibiotics, nutrients) with lazy cell allocation
+    and memory management integration.
     """
     
     def __init__(
@@ -113,9 +224,10 @@ class SpatialGrid:
         self.grid_width = int(math.ceil(width / cell_size))
         self.grid_height = int(math.ceil(height / cell_size))
         
-        # Initialize grid cells
+        # MEMORY OPTIMIZATION: Use lazy initialization for grid cells
+        # Only create cells when they are actually accessed
         self.cells: Dict[Tuple[int, int], GridCell] = {}
-        self._initialize_grid()
+        self._lazy_cell_creation_enabled = True
         
         # Track bacterial positions
         self.bacterial_positions: Dict[str, Coordinate] = {}
@@ -124,17 +236,58 @@ class SpatialGrid:
         self.antibiotic_zones: List[Dict] = []
         self.nutrient_patches: List[Dict] = []
         
+        # Memory management
+        self._disposed = False
+        _initialize_pools()
+        _memory_manager.resource_manager.register(self, "spatial_grids")
+        
         logger.info(f"Initialized spatial grid: {self.grid_width}x{self.grid_height} cells, "
-                   f"cell size: {cell_size}, boundary: {boundary_condition.value}")
+                   f"cell size: {cell_size}, boundary: {boundary_condition.value}, "
+                   f"lazy loading: {self._lazy_cell_creation_enabled}")
+    
+    def _get_or_create_cell(self, grid_index: Tuple[int, int]) -> GridCell:
+        """
+        Get existing cell or create new one lazily.
+        
+        This is the core of the lazy loading optimization - cells are only
+        created when they are actually needed.
+        """
+        if grid_index in self.cells:
+            return self.cells[grid_index]
+        
+        # Create cell lazily
+        i, j = grid_index
+        x = (i + 0.5) * self.cell_size
+        y = (j + 0.5) * self.cell_size
+        coord = Coordinate.create_pooled(x, y)
+        cell = GridCell.create_pooled(coord)
+        self.cells[grid_index] = cell
+        
+        logger.debug(f"Lazily created cell at grid index {grid_index}")
+        return cell
     
     def _initialize_grid(self):
-        """Initialize all grid cells."""
-        for i in range(self.grid_width):
-            for j in range(self.grid_height):
-                x = (i + 0.5) * self.cell_size
-                y = (j + 0.5) * self.cell_size
-                coord = Coordinate(x, y)
-                self.cells[(i, j)] = GridCell(coordinate=coord)
+        """
+        Initialize grid cells.
+        
+        MEMORY OPTIMIZATION: This method is now deprecated in favor of lazy loading.
+        Kept for backward compatibility but does nothing by default.
+        """
+        if not self._lazy_cell_creation_enabled:
+            # Fallback to eager initialization if lazy loading is disabled
+            for i in range(self.grid_width):
+                for j in range(self.grid_height):
+                    x = (i + 0.5) * self.cell_size
+                    y = (j + 0.5) * self.cell_size
+                    coord = Coordinate.create_pooled(x, y)
+                    self.cells[(i, j)] = GridCell.create_pooled(coord)
+    
+    def enable_lazy_loading(self, enabled: bool = True):
+        """Enable or disable lazy cell creation."""
+        self._lazy_cell_creation_enabled = enabled
+        if not enabled:
+            # Pre-create all cells if lazy loading is disabled
+            self._initialize_grid()
     
     def _coordinate_to_grid_index(self, coord: Coordinate) -> Tuple[int, int]:
         """Convert coordinate to grid cell index."""
@@ -155,7 +308,7 @@ class SpatialGrid:
         """Convert grid cell index to coordinate."""
         x = (i + 0.5) * self.cell_size
         y = (j + 0.5) * self.cell_size
-        return Coordinate(x, y)
+        return Coordinate.create_pooled(x, y)
     
     def is_valid_position(self, coord: Coordinate) -> bool:
         """Check if a coordinate is within the grid boundaries."""
@@ -184,9 +337,9 @@ class SpatialGrid:
         if bacterium_id in self.bacterial_positions:
             self.remove_bacterium(bacterium_id)
         
-        # Add to new position
+        # Add to new position using lazy cell creation
         grid_index = self._coordinate_to_grid_index(position)
-        cell = self.cells[grid_index]
+        cell = self._get_or_create_cell(grid_index)
         cell.add_bacterium(bacterium_id)
         self.bacterial_positions[bacterium_id] = position
         
@@ -208,8 +361,11 @@ class SpatialGrid:
         
         position = self.bacterial_positions[bacterium_id]
         grid_index = self._coordinate_to_grid_index(position)
-        cell = self.cells[grid_index]
-        cell.remove_bacterium(bacterium_id)
+        
+        # Only access cell if it exists (lazy loading consideration)
+        if grid_index in self.cells:
+            cell = self.cells[grid_index]
+            cell.remove_bacterium(bacterium_id)
         
         del self.bacterial_positions[bacterium_id]
         logger.debug(f"Removed bacterium {bacterium_id} from {position}")
@@ -276,14 +432,16 @@ class SpatialGrid:
                       check_j < 0 or check_j >= self.grid_height):
                     continue
                 
-                cell = self.cells.get((check_i, check_j))
-                if cell:
+                # LAZY LOADING: Only check cells that exist
+                cell_index = (check_i, check_j)
+                if cell_index in self.cells:
+                    cell = self.cells[cell_index]
                     for other_id in cell.bacteria_ids:
                         if other_id == bacterium_id and not include_self:
                             continue
                         
-                        other_pos = self.bacterial_positions[other_id]
-                        if center_pos.is_within_distance(other_pos, radius):
+                        other_pos = self.bacterial_positions.get(other_id)
+                        if other_pos and center_pos.distance_to(other_pos) <= radius:
                             neighbors.append(other_id)
         
         return neighbors
@@ -431,12 +589,19 @@ class SpatialGrid:
         self.antibiotic_zones.clear()
         self.nutrient_patches.clear()
         
+        # MEMORY OPTIMIZATION: Return cells to object pool when clearing
         for cell in self.cells.values():
             cell.bacteria_ids.clear()
             cell.antibiotic_concentration = 0.0
             cell.nutrient_concentration = 1.0
+            # Return coordinate and cell to their respective pools
+            if hasattr(cell.coordinate, 'release_to_pool'):
+                cell.coordinate.release_to_pool()
+            if hasattr(cell, 'release_to_pool'):
+                cell.release_to_pool()
         
-        logger.info("Cleared spatial grid")
+        self.cells.clear()
+        logger.info("Cleared spatial grid and returned objects to pools")
     
     def handle_boundary_condition(self, position: Coordinate) -> Coordinate:
         """
@@ -484,12 +649,119 @@ class SpatialGrid:
         """
         grid_index = self._coordinate_to_grid_index(position)
         return self.cells.get(grid_index)
+    
+    def dispose(self) -> None:
+        """
+        Dispose of the spatial grid and release all resources.
+        
+        This method implements the Disposable interface and ensures
+        proper cleanup of all pooled objects and resources.
+        """
+        if self._disposed:
+            return
+        
+        logger.info("Disposing spatial grid and releasing resources")
+        
+        # Clear all data and return objects to pools
+        self.clear()
+        
+        # Mark as disposed
+        self._disposed = True
+        
+        # Unregister from memory manager
+        _memory_manager.resource_manager.unregister(self)
+        
+        logger.info("Spatial grid disposed successfully")
+    
+    @property
+    def is_disposed(self) -> bool:
+        """Check if the spatial grid has been disposed."""
+        return self._disposed
+    
+    def get_memory_usage_stats(self) -> Dict[str, Union[int, float]]:
+        """
+        Get memory usage statistics for this spatial grid.
+        
+        Returns:
+            Dictionary with memory usage information
+        """
+        if self._disposed:
+            return {"status": "disposed", "memory_usage_mb": 0}
+        
+        stats = {
+            "total_cells_created": len(self.cells),
+            "max_possible_cells": self.grid_width * self.grid_height,
+            "memory_efficiency_percent": (len(self.cells) / (self.grid_width * self.grid_height)) * 100,
+            "bacteria_count": len(self.bacterial_positions),
+            "antibiotic_zones": len(self.antibiotic_zones),
+            "lazy_loading_enabled": self._lazy_cell_creation_enabled
+        }
+        
+        # Add pool statistics if available
+        if _coordinate_pool:
+            coord_stats = _coordinate_pool.get_stats()
+            stats["coordinate_pool_hit_rate"] = coord_stats.hit_rate
+            stats["coordinate_pool_size"] = coord_stats.current_pool_size
+        
+        if _grid_cell_pool:
+            cell_stats = _grid_cell_pool.get_stats()
+            stats["cell_pool_hit_rate"] = cell_stats.hit_rate
+            stats["cell_pool_size"] = cell_stats.current_pool_size
+        
+        return stats
+    
+    def optimize_memory_usage(self) -> Dict[str, int]:
+        """
+        Perform memory optimization operations.
+        
+        Returns:
+            Dictionary with optimization results
+        """
+        if self._disposed:
+            return {"error": "Cannot optimize disposed grid"}
+        
+        results = {"cells_before": len(self.cells)}
+        
+        # Remove empty cells to save memory (only if lazy loading is enabled)
+        if self._lazy_cell_creation_enabled:
+            empty_cells = []
+            for grid_index, cell in self.cells.items():
+                if (cell.get_bacteria_count() == 0 and 
+                    cell.antibiotic_concentration == 0.0 and 
+                    cell.nutrient_concentration == 1.0):
+                    empty_cells.append(grid_index)
+            
+            # Return empty cells to pools
+            for grid_index in empty_cells:
+                cell = self.cells.pop(grid_index)
+                if hasattr(cell.coordinate, 'release_to_pool'):
+                    cell.coordinate.release_to_pool()
+                if hasattr(cell, 'release_to_pool'):
+                    cell.release_to_pool()
+            
+            results["empty_cells_removed"] = len(empty_cells)
+            results["cells_after"] = len(self.cells)
+            results["memory_saved_percent"] = (len(empty_cells) / results["cells_before"]) * 100 if results["cells_before"] > 0 else 0
+        else:
+            results["empty_cells_removed"] = 0
+            results["cells_after"] = results["cells_before"] 
+            results["memory_saved_percent"] = 0
+        
+        # Trigger garbage collection for object pools
+        if _coordinate_pool:
+            _coordinate_pool.clear()
+        if _grid_cell_pool:
+            _grid_cell_pool.clear()
+        
+        logger.info(f"Memory optimization complete: removed {results['empty_cells_removed']} empty cells")
+        return results
 
 
 class SpatialManager:
     """
     High-level manager for spatial operations and grid management.
-    Optimized for large bacterial populations with efficient data structures.
+    Optimized for large bacterial populations with efficient data structures
+    and memory management integration.
     """
     
     def __init__(self, grid: SpatialGrid):
@@ -506,6 +778,9 @@ class SpatialManager:
         # Movement tracking for optimization
         self._movement_cache: Dict[str, float] = {}  # bacterium_id -> last movement distance
         self._static_bacteria: Set[str] = set()  # Bacteria that haven't moved recently
+        
+        # Memory management integration
+        _initialize_pools()
         
     def initialize_random_population(
         self, 
@@ -525,10 +800,10 @@ class SpatialManager:
         positions = {}
         
         for i, bacterium_id in enumerate(bacterium_ids[:population_size]):
-            # Generate random position
+            # Generate random position using pooled coordinates
             x = np.random.uniform(0, self.grid.width)
             y = np.random.uniform(0, self.grid.height)
-            position = Coordinate(x, y)
+            position = Coordinate.create_pooled(x, y)
             
             # Place bacterium in grid
             if self.grid.place_bacterium(bacterium_id, position):
@@ -538,6 +813,9 @@ class SpatialManager:
                 self.position_cache[bacterium_id] = (position.x, position.y)
             else:
                 logger.warning(f"Failed to place bacterium {bacterium_id}")
+                # Return unused coordinate to pool
+                if hasattr(position, 'release_to_pool'):
+                    position.release_to_pool()
         
         # Mark spatial tree as dirty since we added new bacteria
         self._tree_dirty = True
@@ -744,12 +1022,16 @@ class SpatialManager:
         inactive_ids = set(self.bacterium_positions.keys()) - active_bacteria_ids
         
         for bacterium_id in inactive_ids:
-            # Remove from position tracking
+            # Remove from position tracking and return coordinates to pool
             if bacterium_id in self.bacterium_positions:
                 position = self.bacterium_positions[bacterium_id]
                 cell = self.grid.get_cell_at_position(position)
                 if cell:
                     cell.bacteria_ids.discard(bacterium_id)
+                
+                # MEMORY OPTIMIZATION: Return coordinate to pool
+                if hasattr(position, 'release_to_pool'):
+                    position.release_to_pool()
                 
                 del self.bacterium_positions[bacterium_id]
             
@@ -763,6 +1045,39 @@ class SpatialManager:
             self._tree_dirty = True
             logger.info(f"Cleaned up {len(inactive_ids)} inactive bacteria")
     
+    def cleanup_memory_resources(self) -> Dict[str, int]:
+        """
+        Perform comprehensive memory cleanup for the spatial manager.
+        
+        Returns:
+            Dictionary with cleanup statistics
+        """
+        cleanup_stats = {"coordinates_released": 0, "caches_cleared": 0}
+        
+        # Clear position cache
+        cache_size = len(self.position_cache)
+        self.position_cache.clear()
+        cleanup_stats["caches_cleared"] = cache_size
+        
+        # Clear movement tracking caches
+        self._movement_cache.clear()
+        self._static_bacteria.clear()
+        
+        # Clear spatial tree
+        self._spatial_tree = None
+        self._tree_dirty = True
+        
+        # Clear batch updates
+        self._batch_updates.clear()
+        
+        # Trigger grid memory optimization
+        if hasattr(self.grid, 'optimize_memory_usage'):
+            grid_stats = self.grid.optimize_memory_usage()
+            cleanup_stats.update(grid_stats)
+        
+        logger.info(f"SpatialManager memory cleanup complete: {cleanup_stats}")
+        return cleanup_stats
+
     def simulate_bacterial_movement_batch(
         self, 
         bacterium_ids: List[str], 
@@ -805,7 +1120,7 @@ class SpatialManager:
             self.update_bacterium_position_batch(movements)
         
         return movements
-    
+
     def simulate_bacterial_movement(
         self, 
         bacterium_id: str, 
@@ -832,10 +1147,22 @@ class SpatialManager:
         
         new_x = current_pos.x + distance * np.cos(angle)
         new_y = current_pos.y + distance * np.sin(angle)
-        new_pos = Coordinate(new_x, new_y)
+        
+        # MEMORY OPTIMIZATION: Use pooled coordinate
+        new_pos = Coordinate.create_pooled(new_x, new_y)
         
         # Check boundary conditions
-        new_pos = self.grid.handle_boundary_condition(new_pos)
+        adjusted_pos = self.grid.handle_boundary_condition(new_pos)
+        
+        # If position was adjusted, release the original and create new one
+        if adjusted_pos != new_pos:
+            if hasattr(new_pos, 'release_to_pool'):
+                new_pos.release_to_pool()
+            new_pos = Coordinate.create_pooled(adjusted_pos.x, adjusted_pos.y)
+        
+        # Release old position to pool before updating
+        if hasattr(current_pos, 'release_to_pool'):
+            current_pos.release_to_pool()
         
         # Update position
         self.bacterium_positions[bacterium_id] = new_pos
