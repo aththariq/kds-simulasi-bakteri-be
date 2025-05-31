@@ -3,23 +3,36 @@ from typing import List, Optional, Dict, Any, Union
 from pydantic import BaseModel, Field, validator
 from bson import ObjectId
 from enum import Enum
+from pydantic_core import core_schema
 
 class PyObjectId(ObjectId):
-    """Custom ObjectId type for Pydantic"""
+    """Custom ObjectId type for Pydantic V2"""
     
     @classmethod
-    def __get_validators__(cls):
-        yield cls.validate
+    def __get_pydantic_core_schema__(
+        cls, source_type: Any, handler: Any
+    ) -> core_schema.CoreSchema:
+        """Pydantic V2 schema generation"""
+        return core_schema.no_info_before_validator_function(
+            cls.validate,
+            core_schema.str_schema(),
+            serialization=core_schema.to_string_ser_schema(),
+        )
     
     @classmethod
     def validate(cls, v):
-        if not ObjectId.is_valid(v):
-            raise ValueError("Invalid ObjectId")
-        return ObjectId(v)
-    
-    @classmethod
-    def __modify_schema__(cls, field_schema):
-        field_schema.update(type="string")
+        """Validate ObjectId input and return as string for Pydantic compatibility"""
+        if isinstance(v, ObjectId):
+            return str(v)
+        if isinstance(v, str):
+            if not ObjectId.is_valid(v):
+                raise ValueError("Invalid ObjectId string")
+            return v
+        if hasattr(v, '__str__'):
+            v_str = str(v)
+            if ObjectId.is_valid(v_str):
+                return v_str
+        raise ValueError(f"Invalid ObjectId format: {v}")
 
 class SimulationStatus(str, Enum):
     """Simulation status enumeration"""
@@ -187,7 +200,7 @@ class SimulationResults(BaseModel):
 # MongoDB Collection Models
 class SimulationDocument(BaseModel):
     """MongoDB document model for simulations"""
-    _id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
     simulation_id: str = Field(..., description="Unique simulation identifier")
     metadata: SimulationMetadata = Field(..., description="Simulation metadata")
     results: Optional[SimulationResults] = Field(None, description="Simulation results")
@@ -195,32 +208,32 @@ class SimulationDocument(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
     class Config:
-        allow_population_by_field_name = True
+        populate_by_name = True
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
 
 class PopulationDocument(BaseModel):
     """MongoDB document model for population snapshots"""
-    _id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
     simulation_id: str = Field(..., description="Associated simulation ID")
     snapshot: PopulationSnapshot = Field(..., description="Population snapshot data")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     
     class Config:
-        allow_population_by_field_name = True
+        populate_by_name = True
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
 
 class BacteriumDocument(BaseModel):
     """MongoDB document model for individual bacteria"""
-    _id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
     simulation_id: str = Field(..., description="Associated simulation ID")
     generation: int = Field(..., ge=0, description="Generation number")
     bacterium: BacteriumData = Field(..., description="Bacterium data")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     
     class Config:
-        allow_population_by_field_name = True
+        populate_by_name = True
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
 
