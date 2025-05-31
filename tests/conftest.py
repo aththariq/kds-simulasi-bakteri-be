@@ -3,9 +3,13 @@ Pytest fixtures for API and service testing.
 """
 
 import pytest
+import asyncio
+from unittest.mock import Mock, AsyncMock
 from fastapi.testclient import TestClient
 from main import app
 from services.simulation_service import SimulationService
+from models.bacterium import Bacterium
+from models.population import Population
 
 
 @pytest.fixture
@@ -73,6 +77,75 @@ def completed_simulation(client, created_simulation):
     response = client.post(f"/api/simulations/{created_simulation}/run")
     assert response.status_code == 200
     return created_simulation
+
+
+@pytest.fixture
+def sample_bacterium():
+    """Sample bacterium for testing."""
+    return Bacterium(
+        id="test-bacterium-1",
+        fitness=0.8,
+        resistance_genes={"ampicillin": True, "tetracycline": False},
+        generation=1
+    )
+
+
+@pytest.fixture
+def sample_population():
+    """Sample population for testing."""
+    bacteria = [
+        Bacterium(
+            id=f"bacterium-{i}",
+            fitness=0.5 + (i * 0.1),
+            resistance_genes={"ampicillin": i % 2 == 0},
+            generation=1
+        )
+        for i in range(10)
+    ]
+    return Population(bacteria)
+
+
+@pytest.fixture
+def mock_websocket():
+    """Mock WebSocket for testing."""
+    mock_ws = AsyncMock()
+    mock_ws.send_text = AsyncMock()
+    mock_ws.send_json = AsyncMock()
+    mock_ws.close = AsyncMock()
+    mock_ws.accept = AsyncMock()
+    return mock_ws
+
+
+@pytest.fixture
+def mock_redis():
+    """Mock Redis client for testing."""
+    mock_redis = AsyncMock()
+    mock_redis.get = AsyncMock(return_value=None)
+    mock_redis.set = AsyncMock()
+    mock_redis.delete = AsyncMock()
+    mock_redis.exists = AsyncMock(return_value=False)
+    return mock_redis
+
+
+@pytest.fixture
+def event_loop():
+    """Create an instance of the default event loop for the test session."""
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture
+def simulation_service_sync():
+    """Sync simulation service fixture that mocks async operations."""
+    from unittest.mock import Mock, patch
+    
+    service = SimulationService()
+    service.active_simulations.clear()
+    
+    # Mock the async operations to avoid event loop issues
+    with patch.object(service, '_start_auto_save', return_value=None):
+        yield service
 
 
 @pytest.fixture(autouse=True)

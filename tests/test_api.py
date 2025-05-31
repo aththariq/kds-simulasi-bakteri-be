@@ -8,13 +8,11 @@ from fastapi.testclient import TestClient
 from main import app
 from services.simulation_service import SimulationService
 
-client = TestClient(app)
-
 
 class TestRootEndpoints:
     """Test root and health endpoints."""
     
-    def test_root_endpoint(self):
+    def test_root_endpoint(self, client):
         """Test the root endpoint returns correct information."""
         response = client.get("/")
         
@@ -26,7 +24,7 @@ class TestRootEndpoints:
         assert data["docs_url"] == "/docs"
         assert data["redoc_url"] == "/redoc"
     
-    def test_health_endpoint(self):
+    def test_health_endpoint(self, client):
         """Test the health check endpoint."""
         response = client.get("/health")
         
@@ -45,7 +43,7 @@ class TestSimulationEndpoints:
         from routes.simulation import simulation_service
         simulation_service.active_simulations.clear()
     
-    def test_create_simulation_success(self):
+    def test_create_simulation_success(self, client):
         """Test successful simulation creation."""
         payload = {
             "initial_population_size": 1000,
@@ -64,7 +62,7 @@ class TestSimulationEndpoints:
         assert data["parameters"]["initial_population_size"] == 1000
         assert data["parameters"]["mutation_rate"] == 0.001
     
-    def test_create_simulation_with_defaults(self):
+    def test_create_simulation_with_defaults(self, client):
         """Test simulation creation with default parameters."""
         payload = {}
         
@@ -76,7 +74,7 @@ class TestSimulationEndpoints:
         assert data["parameters"]["initial_population_size"] == 1000  # default
         assert data["parameters"]["mutation_rate"] == 0.001  # default
     
-    def test_create_simulation_validation_error(self):
+    def test_create_simulation_validation_error(self, client):
         """Test simulation creation with invalid parameters."""
         payload = {
             "initial_population_size": 5,  # Too small
@@ -91,7 +89,7 @@ class TestSimulationEndpoints:
         error_data = response.json()
         assert "detail" in error_data
     
-    def test_list_simulations_empty(self):
+    def test_list_simulations_empty(self, client):
         """Test listing simulations when none exist."""
         response = client.get("/api/simulations/")
         
@@ -100,7 +98,7 @@ class TestSimulationEndpoints:
         assert data["active_simulations"] == 0
         assert data["simulations"] == []
     
-    def test_list_simulations_with_data(self):
+    def test_list_simulations_with_data(self, client):
         """Test listing simulations with existing data."""
         # Create a simulation first
         payload = {"initial_population_size": 500}
@@ -116,7 +114,7 @@ class TestSimulationEndpoints:
         assert len(data["simulations"]) == 1
         assert data["simulations"][0]["status"] == "initialized"
     
-    def test_get_simulation_status_success(self):
+    def test_get_simulation_status_success(self, client):
         """Test getting simulation status for existing simulation."""
         # Create a simulation first
         payload = {"initial_population_size": 500}
@@ -132,7 +130,7 @@ class TestSimulationEndpoints:
         assert data["status"] == "initialized"
         assert data["current_generation"] == 0
     
-    def test_get_simulation_status_not_found(self):
+    def test_get_simulation_status_not_found(self, client):
         """Test getting simulation status for non-existent simulation."""
         fake_id = str(uuid.uuid4())
         response = client.get(f"/api/simulations/{fake_id}")
@@ -141,7 +139,7 @@ class TestSimulationEndpoints:
         error_data = response.json()
         assert "detail" in error_data
     
-    def test_run_simulation_success(self):
+    def test_run_simulation_success(self, client):
         """Test running a simulation successfully."""
         # Create a simulation first with small parameters for quick testing
         payload = {
@@ -162,7 +160,7 @@ class TestSimulationEndpoints:
         assert "final_population_size" in data
         assert "results" in data
     
-    def test_run_simulation_not_found(self):
+    def test_run_simulation_not_found(self, client):
         """Test running a non-existent simulation."""
         fake_id = str(uuid.uuid4())
         response = client.post(f"/api/simulations/{fake_id}/run")
@@ -171,7 +169,7 @@ class TestSimulationEndpoints:
         error_data = response.json()
         assert "detail" in error_data
     
-    def test_delete_simulation_success(self):
+    def test_delete_simulation_success(self, client):
         """Test deleting a simulation successfully."""
         # Create a simulation first
         payload = {"initial_population_size": 500}
@@ -187,7 +185,7 @@ class TestSimulationEndpoints:
         get_response = client.get(f"/api/simulations/{simulation_id}")
         assert get_response.status_code == 404
     
-    def test_delete_simulation_not_found(self):
+    def test_delete_simulation_not_found(self, client):
         """Test deleting a non-existent simulation."""
         fake_id = str(uuid.uuid4())
         response = client.delete(f"/api/simulations/{fake_id}")

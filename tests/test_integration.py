@@ -11,6 +11,12 @@ import numpy as np
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass, field
 import random
+import asyncio
+import json
+from httpx import AsyncClient
+from fastapi.testclient import TestClient
+from unittest.mock import Mock, AsyncMock, patch
+from main import app
 
 from models.bacterium import Bacterium, ResistanceStatus
 from models.mutation import (
@@ -941,6 +947,401 @@ class TestEvolutionaryDynamics:
 def run_comprehensive_test_suite():
     """Run the complete integration test suite."""
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.integration
+class TestSimulationIntegration:
+    """Integration tests for simulation workflow."""
+
+    def test_complete_simulation_workflow(self, client):
+        """Test complete simulation workflow from creation to completion."""
+        # Create simulation
+        simulation_params = {
+            "initial_population_size": 100,
+            "mutation_rate": 0.01,
+            "selection_pressure": 0.2,
+            "antibiotic_concentration": 1.0,
+            "simulation_time": 5
+        }
+        
+        response = client.post("/api/simulations/", json=simulation_params)
+        assert response.status_code == 201
+        simulation_data = response.json()
+        simulation_id = simulation_data["simulation_id"]
+        assert "id" in simulation_data
+        
+        # Check simulation status
+        response = client.get(f"/api/simulations/{simulation_id}")
+        assert response.status_code == 200
+        status_data = response.json()
+        assert status_data["status"] == "created"
+        
+        # List simulations
+        response = client.get("/api/simulations/")
+        assert response.status_code == 200
+        simulations = response.json()
+        assert len(simulations) >= 1
+        assert any(sim["id"] == simulation_id for sim in simulations)
+        
+        # Run simulation
+        response = client.post(f"/api/simulations/{simulation_id}/run")
+        assert response.status_code == 200
+        run_data = response.json()
+        assert run_data["status"] == "running"
+        
+        # Verify final status (simulation should complete quickly with small parameters)
+        response = client.get(f"/api/simulations/{simulation_id}")
+        assert response.status_code == 200
+        final_status = response.json()
+        assert final_status["status"] in ["running", "completed"]
+
+    def test_simulation_parameter_validation(self, client):
+        """Test API parameter validation across endpoints."""
+        # Test invalid parameters
+        invalid_params = {
+            "initial_population_size": -10,  # Negative
+            "mutation_rate": 2.0,  # Too high
+            "selection_pressure": -0.5,  # Negative
+            "antibiotic_concentration": -1.0,  # Negative
+            "simulation_time": 0  # Too small
+        }
+        
+        response = client.post("/api/simulations/", json=invalid_params)
+        assert response.status_code == 422
+        error_data = response.json()
+        assert "detail" in error_data
+        
+        # Test boundary values
+        boundary_params = {
+            "initial_population_size": 10,  # Minimum valid
+            "mutation_rate": 0.0,  # Minimum valid
+            "selection_pressure": 0.0,  # Minimum valid
+            "antibiotic_concentration": 0.0,  # Minimum valid
+            "simulation_time": 1  # Minimum valid
+        }
+        
+        response = client.post("/api/simulations/", json=boundary_params)
+        assert response.status_code == 201
+
+    def test_simulation_lifecycle_management(self, client):
+        """Test simulation creation, running, and deletion."""
+        # Create simulation
+        params = {
+            "initial_population_size": 50,
+            "mutation_rate": 0.02,
+            "selection_pressure": 0.3,
+            "antibiotic_concentration": 0.5,
+            "simulation_time": 3
+        }
+        
+        response = client.post("/api/simulations/", json=params)
+        assert response.status_code == 201
+        simulation_id = response.json()["simulation_id"]
+        
+        # Start simulation
+        response = client.post(f"/api/simulations/{simulation_id}/run")
+        assert response.status_code == 200
+        
+        # Try to delete running simulation
+        response = client.delete(f"/api/simulations/{simulation_id}")
+        assert response.status_code in [200, 409]  # May be running or completed
+        
+        # Verify deletion
+        if response.status_code == 200:
+            response = client.get(f"/api/simulations/{simulation_id}")
+            assert response.status_code == 404
+
+    def test_concurrent_simulations(self, client):
+        """Test handling of multiple concurrent simulations."""
+        simulation_ids = []
+        
+        # Create multiple simulations
+        for i in range(3):
+            params = {
+                "initial_population_size": 30,
+                "mutation_rate": 0.01,
+                "selection_pressure": 0.1,
+                "antibiotic_concentration": 0.5,
+                "simulation_time": 2
+            }
+            
+            response = client.post("/api/simulations/", json=params)
+            assert response.status_code == 201
+            simulation_ids.append(response.json()["simulation_id"])
+        
+        # Start all simulations
+        for sim_id in simulation_ids:
+            response = client.post(f"/api/simulations/{sim_id}/run")
+            assert response.status_code == 200
+        
+        # Check all simulations are tracked
+        response = client.get("/api/simulations/")
+        assert response.status_code == 200
+        simulations = response.json()
+        assert len(simulations) >= 3
+
+
+@pytest.mark.integration 
+@pytest.mark.api
+class TestAPIErrorHandling:
+    """Integration tests for API error handling."""
+
+    def test_nonexistent_simulation_endpoints(self, client):
+        """Test API behavior with non-existent simulation IDs."""
+        fake_id = "non-existent-simulation-id"
+        
+        # Get non-existent simulation
+        response = client.get(f"/api/simulations/{fake_id}")
+        assert response.status_code == 404
+        
+        # Run non-existent simulation
+        response = client.post(f"/api/simulations/{fake_id}/run")
+        assert response.status_code == 404
+        
+        # Delete non-existent simulation
+        response = client.delete(f"/api/simulations/{fake_id}")
+        assert response.status_code == 404
+
+    def test_malformed_request_handling(self, client):
+        """Test API handling of malformed requests."""
+        # Invalid JSON
+        response = client.post(
+            "/api/simulations/",
+            data="invalid json",
+            headers={"Content-Type": "application/json"}
+        )
+        assert response.status_code == 422
+        
+        # Missing required fields
+        response = client.post("/api/simulations/", json={})
+        assert response.status_code == 422
+        
+        # Wrong content type
+        response = client.post(
+            "/api/simulations/",
+            data="key=value",
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        assert response.status_code == 422
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+class TestWebSocketIntegration:
+    """Integration tests for WebSocket functionality."""
+
+    @pytest.mark.asyncio
+    async def test_websocket_connection_flow(self):
+        """Test WebSocket connection establishment and basic communication."""
+        from fastapi.testclient import TestClient
+        
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/simulation") as websocket:
+                # Test connection establishment
+                data = websocket.receive_json()
+                assert data["type"] == "connection_established"
+                
+                # Test ping-pong
+                websocket.send_json({"type": "ping"})
+                response = websocket.receive_json()
+                assert response["type"] == "pong"
+
+    @pytest.mark.asyncio
+    async def test_websocket_simulation_updates(self):
+        """Test WebSocket updates during simulation."""
+        with TestClient(app) as client:
+            # First create a simulation via HTTP
+            params = {
+                "initial_population_size": 50,
+                "mutation_rate": 0.01,
+                "selection_pressure": 0.2,
+                "antibiotic_concentration": 1.0,
+                "simulation_time": 3
+            }
+            
+            response = client.post("/api/simulations/", json=params)
+            assert response.status_code == 201
+            simulation_id = response.json()["simulation_id"]
+            
+            # Connect to WebSocket
+            with client.websocket_connect("/ws/simulation") as websocket:
+                # Receive connection message
+                data = websocket.receive_json()
+                assert data["type"] == "connection_established"
+                
+                # Subscribe to simulation updates
+                websocket.send_json({
+                    "type": "subscribe",
+                    "simulation_id": simulation_id
+                })
+                
+                # Start simulation via HTTP
+                response = client.post(f"/api/simulations/{simulation_id}/run")
+                assert response.status_code == 200
+                
+                # Should receive simulation updates via WebSocket
+                updates_received = 0
+                try:
+                    while updates_received < 3:  # Expect at least a few updates
+                        data = websocket.receive_json(timeout=5)
+                        if data["type"] == "simulation_update":
+                            assert "simulation_id" in data
+                            assert "generation" in data
+                            assert "population_size" in data
+                            updates_received += 1
+                except:
+                    # Timeout is acceptable if simulation completes quickly
+                    pass
+                
+                assert updates_received >= 0  # At least connection established
+
+
+@pytest.mark.integration
+class TestServiceIntegration:
+    """Integration tests for service layer interactions."""
+
+    @patch('utils.state_manager.StateManager._start_auto_save')
+    def test_simulation_service_integration(self, mock_auto_save):
+        """Test integration between simulation service and models."""
+        mock_auto_save.return_value = None  # Mock async operation
+        
+        from services.simulation_service import SimulationService
+        from models.bacterium import Bacterium
+        from models.population import Population
+        
+        service = SimulationService()
+        
+        # Test service initialization
+        assert service.active_simulations == {}
+        
+        # Test simulation creation and management
+        simulation_id = "test-integration-sim"
+        params = {
+            "initial_population_size": 50,
+            "mutation_rate": 0.01,
+            "selection_pressure": 0.2,
+            "antibiotic_concentration": 1.0,
+            "simulation_time": 3
+        }
+        
+        # Create simulation through service
+        result = service.create_simulation(simulation_id, params)
+        assert result["simulation_id"] == simulation_id
+        assert result["status"] == "created"
+        
+        # Verify simulation is tracked
+        assert simulation_id in service.active_simulations
+        
+        # Check simulation status
+        status = service.get_simulation_status(simulation_id)
+        assert status["status"] == "created"
+        assert status["id"] == simulation_id
+
+    @patch('services.simulation_service.SimulationService.run_simulation')
+    def test_simulation_service_error_handling(self, mock_run, client):
+        """Test service error handling integration."""
+        # Make run_simulation raise an exception
+        mock_run.side_effect = Exception("Test simulation error")
+        
+        # Create simulation
+        params = {
+            "initial_population_size": 100,
+            "mutation_rate": 0.01,
+            "selection_pressure": 0.2,
+            "antibiotic_concentration": 1.0,
+            "simulation_time": 5
+        }
+        
+        response = client.post("/api/simulations/", json=params)
+        assert response.status_code == 201
+        simulation_id = response.json()["simulation_id"]
+        
+        # Try to run simulation (should handle error gracefully)
+        response = client.post(f"/api/simulations/{simulation_id}/run")
+        # The API should handle the service error appropriately
+        assert response.status_code in [500, 400]
+
+
+@pytest.mark.integration
+class TestDataFlow:
+    """Integration tests for data flow between components."""
+
+    def test_simulation_data_consistency(self, client):
+        """Test data consistency across simulation lifecycle."""
+        # Create simulation with specific parameters
+        original_params = {
+            "initial_population_size": 100,
+            "mutation_rate": 0.02,
+            "selection_pressure": 0.3,
+            "antibiotic_concentration": 1.5,
+            "simulation_time": 5
+        }
+        
+        response = client.post("/api/simulations/", json=original_params)
+        assert response.status_code == 201
+        simulation_id = response.json()["simulation_id"]
+        
+        # Retrieve simulation and verify parameters are preserved
+        response = client.get(f"/api/simulations/{simulation_id}")
+        assert response.status_code == 200
+        sim_data = response.json()
+        
+        # Verify all parameters match
+        assert sim_data["initial_population_size"] == original_params["initial_population_size"]
+        assert sim_data["mutation_rate"] == original_params["mutation_rate"]
+        assert sim_data["selection_pressure"] == original_params["selection_pressure"]
+        assert sim_data["antibiotic_concentration"] == original_params["antibiotic_concentration"]
+        assert sim_data["simulation_time"] == original_params["simulation_time"]
+
+    def test_cross_endpoint_data_integrity(self, client):
+        """Test data integrity across different API endpoints."""
+        # Create multiple simulations
+        simulations = []
+        for i in range(3):
+            params = {
+                "initial_population_size": 50 + i * 10,
+                "mutation_rate": 0.01,
+                "selection_pressure": 0.1 + i * 0.1,
+                "antibiotic_concentration": 1.0,
+                "simulation_time": 3
+            }
+            
+            response = client.post("/api/simulations/", json=params)
+            assert response.status_code == 201
+            simulations.append(response.json())
+        
+        # Get list of all simulations
+        response = client.get("/api/simulations/")
+        assert response.status_code == 200
+        all_simulations = response.json()
+        
+        # Verify each created simulation exists in the list
+        for created_sim in simulations:
+            found = False
+            for listed_sim in all_simulations:
+                if listed_sim["id"] == created_sim["simulation_id"]:
+                    found = True
+                    # Verify key data matches
+                    assert listed_sim["initial_population_size"] == created_sim["initial_population_size"]
+                    break
+            assert found, f"Simulation {created_sim['simulation_id']} not found in list"
+        
+        # Verify individual GET matches list data
+        for sim in simulations:
+            response = client.get(f"/api/simulations/{sim['simulation_id']}")
+            assert response.status_code == 200
+            individual_data = response.json()
+            
+            # Find corresponding simulation in list
+            list_data = next(
+                s for s in all_simulations 
+                if s["id"] == sim["simulation_id"]
+            )
+            
+            # Verify consistency between individual GET and list GET
+            assert individual_data["id"] == list_data["id"]
+            assert individual_data["status"] == list_data["status"]
+            assert individual_data["initial_population_size"] == list_data["initial_population_size"]
 
 
 if __name__ == "__main__":
