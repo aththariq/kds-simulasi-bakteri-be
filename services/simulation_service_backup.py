@@ -9,7 +9,7 @@ import random
 from datetime import datetime
 import uuid
 from models.population import Population, PopulationConfig
-from models.selection import SelectionPressure, AntimicrobialPressure, PressureConfig, PressureType, SelectionEnvironment
+from models.selection import SelectionPressure, AntimicrobialPressure, PressureConfig, PressureType
 from models.fitness import ComprehensiveFitnessCalculator
 from models.spatial import SpatialGrid, SpatialManager, BoundaryCondition
 from models.resistance import EnvironmentalContext
@@ -71,7 +71,8 @@ class SimulationService:
             # Initialize population
             population_config = PopulationConfig(population_size=initial_population_size)
             population = Population(config=population_config)
-            population.initialize_population()            # Initialize selection environment with antimicrobial pressure
+            population.initialize_population()
+              # Initialize selection pressure
             pressure_config = PressureConfig(
                 pressure_type=PressureType.ANTIMICROBIAL,
                 intensity=antibiotic_concentration,
@@ -82,11 +83,7 @@ class SimulationService:
                     'max_kill_rate': 0.95
                 }
             )
-            antimicrobial_pressure = AntimicrobialPressure(config=pressure_config)
-            
-            # Create selection environment and add the pressure
-            selection = SelectionEnvironment()
-            selection.add_pressure(antimicrobial_pressure)
+            selection = AntimicrobialPressure(config=pressure_config)
             
             # Initialize fitness calculator
             fitness_calc = ComprehensiveFitnessCalculator()
@@ -188,7 +185,7 @@ class SimulationService:
                     else:
                         callback(data)
                 except Exception as e:
-                    logger.error(f"Error in progress callback: {e}")
+                    print(f"Error in progress callback: {e}")
     
     async def run_simulation_async(self, simulation_id: str) -> AsyncGenerator[Dict[str, Any], None]:
         """
@@ -213,8 +210,7 @@ class SimulationService:
             {
                 "state": SimulationState.RUNNING,
                 "start_time": datetime.utcnow()
-            }
-        )
+            }        )
         
         population = sim_data["population"]
         selection = sim_data["selection"]
@@ -228,8 +224,7 @@ class SimulationService:
             # Run simulation for specified number of generations
             for generation in range(max_generations):
                 generation_start = datetime.utcnow()
-                
-                # Create environmental context with antibiotic concentration
+                  # Create environmental context with antibiotic concentration
                 environmental_context = EnvironmentalContext(
                     antibiotic_concentration=sim_data["parameters"]["antibiotic_concentration"],
                     generation=generation
@@ -246,8 +241,7 @@ class SimulationService:
                 
                 for bacterium in population.bacteria_by_id.values():
                     if hasattr(bacterium, 'fitness') and hasattr(bacterium, 'id'):
-                        try:
-                            fitness_result = fitness_calc.calculate_fitness(
+                        try:                            fitness_result = fitness_calc.calculate_fitness(
                                 bacterium=bacterium,
                                 environmental_context=environmental_context,
                                 population_context=population_context
@@ -264,8 +258,7 @@ class SimulationService:
                 
                 # Apply selection pressure
                 bacteria_list = list(population.bacteria_by_id.values())
-                
-                # Defensive check - ensure we only have Bacterium objects
+                  # Defensive check - ensure we only have Bacterium objects
                 bacteria_list = [b for b in bacteria_list if hasattr(b, 'fitness') and hasattr(b, 'id')]
                 
                 population_context = {
@@ -312,7 +305,7 @@ class SimulationService:
                 # Record data for this generation
                 sim_data["results"]["population_history"].append(population.size)
                 sim_data["results"]["resistance_history"].append(post_mutation_resistance)
-                sim_data["results"]["fitness_history"].append(float(np.mean(list(fitness_scores.values()))))
+                sim_data["results"]["fitness_history"].append(float(np.mean(fitness_scores)))
                 sim_data["results"]["generation_times"].append(generation_time)
                 sim_data["results"]["mutation_events"].extend(mutation_events)
                 
@@ -352,8 +345,7 @@ class SimulationService:
                         )
                         if new_position:
                             bacterium_positions[bacterium_id] = new_position
-                
-                # Get spatial statistics
+                  # Get spatial statistics
                 grid_stats = spatial_grid.get_grid_statistics()
                 
                 # Prepare spatial data for client updates with proper bacteria data
@@ -418,7 +410,7 @@ class SimulationService:
                     "progress_percentage": sim_data["progress_percentage"],
                     "population_size": population.size,
                     "average_resistance": post_mutation_resistance,
-                    "average_fitness": float(np.mean(list(fitness_scores.values()))),
+                    "average_fitness": float(np.mean(fitness_scores)),
                     "diversity_index": diversity,
                     "generation_time": generation_time,
                     "mutations_this_generation": len(mutation_events),
@@ -519,65 +511,14 @@ class SimulationService:
 
         # Run simulation for specified number of generations
         for generation in range(max_generations):
-            # Create environmental context with antibiotic concentration
-            environmental_context = EnvironmentalContext(
-                antibiotic_concentration=sim_data["parameters"]["antibiotic_concentration"],
-                generation=generation
-            )
-            
-            # Calculate fitness for each bacterium in the population
-            fitness_scores = {}
-            population_context = {
-                'total_population': population.size,
-                'generation': generation,
-                'carrying_capacity': population.config.initial_population_size * 2,
-                'local_density': population.size / max(1, population.config.grid_width * population.config.grid_height) if population.config.use_spatial else 1.0
-            }
-            
-            for bacterium in population.bacteria_by_id.values():
-                if hasattr(bacterium, 'fitness') and hasattr(bacterium, 'id'):
-                    try:
-                        fitness_result = fitness_calc.calculate_fitness(
-                            bacterium=bacterium,
-                            environmental_context=environmental_context,
-                            population_context=population_context
-                        )
-                        fitness_scores[bacterium.id] = fitness_result.final_fitness
-                        # Update bacterium's fitness with the calculated value
-                        bacterium.fitness = fitness_result.final_fitness
-                    except Exception as e:
-                        logger.error(f"Failed to calculate fitness for bacterium {bacterium.id}: {e}")
-                        # Use original fitness as fallback
-                        fitness_scores[bacterium.id] = bacterium.fitness
+            # Calculate fitness for current population
+            fitness_scores = fitness_calc.calculate_fitness(population)
 
             # Apply selection pressure
-            bacteria_list = list(population.bacteria_by_id.values())
-            bacteria_list = [b for b in bacteria_list if hasattr(b, 'fitness') and hasattr(b, 'id')]
-            
-            population_context = {
-                'total_population': population.size,
-                'generation': generation
-            }
-            selection_results = selection.apply_selection(bacteria_list, population_context, generation)
-            
-            # Apply selection results
-            if selection_results:
-                bacterium_map = {result.bacterium_id: result for result in selection_results}
-                survivors = []
-                
-                for bacterium in bacteria_list:
-                    if bacterium.id in bacterium_map:
-                        result = bacterium_map[bacterium.id]
-                        bacterium.fitness = result.modified_fitness
-                        if np.random.random() < result.survival_probability:
-                            survivors.append(bacterium)
-                
-                population.clear()
-                population._batch_add_bacteria(survivors)
+            population = selection.apply_selection(population, fitness_scores)
 
             # Apply mutations
-            population.advance_generation()
-            mutation_events = population.mutate(mutation_rate)
+            population.mutate(mutation_rate)
 
             # Record data for this generation
             sim_data["results"]["population_history"].append(population.size)
@@ -585,7 +526,7 @@ class SimulationService:
                 population.get_average_resistance()
             )
             sim_data["results"]["fitness_history"].append(
-                float(np.mean(list(fitness_scores.values())))
+                float(np.mean(fitness_scores))
             )
 
             sim_data["current_generation"] = generation + 1

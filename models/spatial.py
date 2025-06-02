@@ -110,8 +110,20 @@ class BoundaryCondition(Enum):
 @dataclass
 class Coordinate:
     """Represents a 2D coordinate in the spatial grid."""
-    x: float
-    y: float
+    
+    def __init__(self, x: float, y: float):
+        self.x = x
+        self.y = y
+    
+    def __hash__(self):
+        """Make coordinate hashable."""
+        return hash((self.x, self.y))
+    
+    def __eq__(self, other):
+        """Make coordinate comparable."""
+        if not isinstance(other, Coordinate):
+            return False
+        return abs(self.x - other.x) < 1e-9 and abs(self.y - other.y) < 1e-9
     
     @classmethod
     def create_pooled(cls, x: float, y: float) -> 'Coordinate':
@@ -156,6 +168,16 @@ class GridCell:
     bacteria_ids: Set[str] = field(default_factory=set)
     antibiotic_concentration: float = 0.0
     nutrient_concentration: float = 1.0
+    
+    def __hash__(self):
+        """Make grid cell hashable based on coordinate."""
+        return hash(self.coordinate)
+    
+    def __eq__(self, other):
+        """Make grid cell comparable based on coordinate."""
+        if not isinstance(other, GridCell):
+            return False
+        return self.coordinate == other.coordinate
     
     @classmethod
     def create_pooled(cls, coordinate: Coordinate) -> 'GridCell':

@@ -9,7 +9,7 @@ import random
 from datetime import datetime
 import uuid
 from models.population import Population, PopulationConfig
-from models.selection import SelectionPressure, AntimicrobialPressure, PressureConfig, PressureType, SelectionEnvironment
+from models.selection import SelectionPressure, AntimicrobialPressure, PressureConfig, PressureType
 from models.fitness import ComprehensiveFitnessCalculator
 from models.spatial import SpatialGrid, SpatialManager, BoundaryCondition
 from models.resistance import EnvironmentalContext
@@ -71,7 +71,9 @@ class SimulationService:
             # Initialize population
             population_config = PopulationConfig(population_size=initial_population_size)
             population = Population(config=population_config)
-            population.initialize_population()            # Initialize selection environment with antimicrobial pressure
+            population.initialize_population()
+            
+            # Initialize selection pressure
             pressure_config = PressureConfig(
                 pressure_type=PressureType.ANTIMICROBIAL,
                 intensity=antibiotic_concentration,
@@ -82,11 +84,7 @@ class SimulationService:
                     'max_kill_rate': 0.95
                 }
             )
-            antimicrobial_pressure = AntimicrobialPressure(config=pressure_config)
-            
-            # Create selection environment and add the pressure
-            selection = SelectionEnvironment()
-            selection.add_pressure(antimicrobial_pressure)
+            selection = AntimicrobialPressure(config=pressure_config)
             
             # Initialize fitness calculator
             fitness_calc = ComprehensiveFitnessCalculator()

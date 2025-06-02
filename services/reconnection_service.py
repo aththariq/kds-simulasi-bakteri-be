@@ -18,8 +18,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 from datetime import datetime, timedelta
+import uuid
 
-from .websocket_error_handler import WebSocketErrorHandler, ErrorCode, ErrorSeverity
+from .websocket_error_handler import ErrorHandler, ErrorCode, ErrorSeverity, ErrorCategory, ErrorContext
 
 
 class ReconnectionState(Enum):
@@ -200,10 +201,10 @@ class ReconnectionManager:
     def __init__(
         self,
         config: Optional[ReconnectionConfig] = None,
-        error_handler: Optional[WebSocketErrorHandler] = None
+        error_handler: Optional[ErrorHandler] = None
     ):
         self.config = config or ReconnectionConfig()
-        self.error_handler = error_handler or WebSocketErrorHandler()
+        self.error_handler = error_handler or ErrorHandler()
         self.logger = logging.getLogger(__name__)
         
         # State tracking
@@ -324,8 +325,19 @@ class ReconnectionManager:
             ErrorCode.CONNECTION_LOST,
             f"Client {client_id} disconnected: {reason}",
             ErrorSeverity.MEDIUM,
-            context={'client_id': client_id, 'reason': reason}
+            category=ErrorCategory.CONNECTION,
+            context=ErrorContext(client_id=client_id, metadata={"reason": reason})
         )
+        
+        # Potentially notify error handler about permanent failure
+        if self.error_handler:
+            await self.error_handler.handle_error(
+                error_code=ErrorCode.CONNECTION_LOST,
+                message=f"Client {client_id} permanently disconnected after max retries. Reason: {reason}",
+                severity=ErrorSeverity.HIGH,
+                category=ErrorCategory.CONNECTION,
+                context=ErrorContext(client_id=client_id, metadata={"reason": reason, "retries": self.backoff_strategy.retry_count})
+            )
         
         # Start reconnection process
         if self._reconnection_task is None or self._reconnection_task.done():
@@ -407,7 +419,8 @@ class ReconnectionManager:
                         ErrorCode.RECONNECTION_FAILED,
                         f"Reconnection attempt {self.backoff_strategy.retry_count} failed for client {client_id}",
                         ErrorSeverity.MEDIUM,
-                        context={'client_id': client_id, 'attempt': self.backoff_strategy.retry_count}
+                        category=ErrorCategory.CONNECTION,
+                        context=ErrorContext(client_id=client_id, metadata={'attempt': self.backoff_strategy.retry_count})
                     )
             
             except Exception as e:
@@ -419,7 +432,8 @@ class ReconnectionManager:
                     ErrorCode.RECONNECTION_ERROR,
                     f"Reconnection error for client {client_id}: {str(e)}",
                     ErrorSeverity.HIGH,
-                    context={'client_id': client_id, 'error': str(e)}
+                    category=ErrorCategory.CONNECTION,
+                    context=ErrorContext(client_id=client_id, metadata={'error': str(e)})
                 )
         
         # If we've exhausted retries, mark as failed
@@ -429,10 +443,11 @@ class ReconnectionManager:
             await self._notify_state_change(old_state)
             
             await self.error_handler.handle_error(
-                ErrorCode.RECONNECTION_EXHAUSTED,
+                ErrorCode.RECONNECTION_MAX_RETRIES,
                 f"Reconnection failed permanently for client {client_id} after {self.backoff_strategy.retry_count} attempts",
                 ErrorSeverity.HIGH,
-                context={'client_id': client_id, 'attempts': self.backoff_strategy.retry_count}
+                category=ErrorCategory.CONNECTION,
+                context=ErrorContext(client_id=client_id, metadata={'attempts': self.backoff_strategy.retry_count})
             )
             
             self.logger.error(f"Reconnection failed permanently for client {client_id}")
@@ -483,6 +498,11 @@ class ReconnectionManager:
         if self._reconnection_task:
             self._reconnection_task.cancel()
         self.logger.info("Reconnection state manually reset")
+    
+    def generate_reconnection_id(self, client_id: str) -> str:
+        """Generate a unique reconnection ID for a client."""
+        timestamp = int(time.time() * 1000)  # milliseconds
+        return f"reconnect_{client_id}_{timestamp}_{uuid.uuid4().hex[:8]}"
 
 
 # Global instance for easy access
@@ -510,4 +530,4 @@ async def shutdown_reconnection_manager() -> None:
     global _global_reconnection_manager
     if _global_reconnection_manager:
         await _global_reconnection_manager.stop()
-        _global_reconnection_manager = None 
+        _global_reconnection_manager = None

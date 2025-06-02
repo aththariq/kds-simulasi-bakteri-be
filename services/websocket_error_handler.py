@@ -53,6 +53,7 @@ class ErrorCategory(Enum):
     SERVER = "server"                 # Internal server errors
     CLIENT = "client"                 # Client-side error conditions
     RATE_LIMIT = "rate_limit"         # Rate limiting violations
+    HEARTBEAT = "heartbeat"           # Heartbeat and keep-alive related issues
 
 
 class ErrorCode(Enum):
@@ -63,6 +64,9 @@ class ErrorCode(Enum):
     CONNECTION_REJECTED = "WS_1003"
     CONNECTION_LOST = "WS_1004"
     HANDSHAKE_FAILED = "WS_1005"
+    RECONNECTION_FAILED = "WS_1006"
+    RECONNECTION_TIMEOUT = "WS_1007"
+    RECONNECTION_MAX_RETRIES = "WS_1008"
     
     # Authentication Errors (1100-1199)
     AUTH_REQUIRED = "WS_1101"
@@ -419,12 +423,75 @@ class ErrorHandler:
             self.error_history = self.error_history[-self.max_error_history:]
     
     async def _notify_client(self, websocket: WebSocket, error: WebSocketError, client_id: str):
-        """Send error notification to client via WebSocket."""
-        try:
-            error_message = error.to_websocket_message(client_id)
-            await websocket.send_text(error_message.to_json())
-        except Exception as e:
-            self.logger.error(f"Failed to notify client {client_id} of error: {e}")
+        """Send error notification to the client."""
+        if websocket and FASTAPI_AVAILABLE:
+            try:
+                error_message_obj = error.to_websocket_message(client_id)
+                
+                if error_message_obj:
+                    if isinstance(error_message_obj, dict): # Fallback dict from to_websocket_message
+                        await websocket.send_json(error_message_obj)
+                    elif hasattr(error_message_obj, 'to_json'): # WebSocketProtocolMessage
+                        await websocket.send_text(error_message_obj.to_json())
+                    else: # Should not happen if to_websocket_message is typed correctly
+                        error_type_value = "ERROR"
+                        try:
+                            from schemas.websocket_protocol import MessageType as WSMessageType
+                            error_type_value = WSMessageType.ERROR.value
+                        except Exception:
+                            logger.error("Could not import MessageType for generic error, using literal 'ERROR'")
+
+                        error_data = {
+                            "type": error_type_value,
+                            "client_id": client_id,
+                            "id": str(uuid.uuid4()),
+                            "timestamp": datetime.now().isoformat(),
+                            "protocol_version": "1.0", # Use literal
+                            "priority": "high", 
+                            "error": {
+                                "error_code": error.code.value if error.code else "UNKNOWN_ERROR",
+                                "error_message": error.message or "An unknown error occurred.",
+                                "severity": error.severity.value if error.severity else "medium",
+                                "details": {
+                                    "category": error.category.value if error.category else "UNKNOWN",
+                                    "correlation_id": error.correlation_id,
+                                    "timestamp": error.timestamp.isoformat()
+                                }
+                            }
+                        }
+                        await websocket.send_json(error_data)
+                        logger.warning(f"Sent generic JSON error to {client_id} due to unexpected error message object type: {type(error_message_obj)}")
+                else: 
+                    logger.warning(f"Protocol unavailable or MessageFactory failed, sending basic JSON error to {client_id} for code {error.code.value if error.code else 'UNKNOWN'}")
+                    error_type_value = "ERROR"
+                    try:
+                        from schemas.websocket_protocol import MessageType as WSMessageType
+                        error_type_value = WSMessageType.ERROR.value
+                    except Exception: 
+                        logger.error("Could not import MessageType for basic error, using literal 'ERROR'")
+
+                    fallback_error = {
+                        "type": error_type_value, 
+                        "client_id": client_id,
+                        "id": str(uuid.uuid4()),
+                        "timestamp": datetime.now().isoformat(),
+                        "protocol_version": "1.0", # Use literal
+                        "priority": "high",
+                        "error": {
+                            "error_code": error.code.value if error.code else "UNKNOWN_ERROR_CODE",
+                            "error_message": error.message or "Fallback error message",
+                            "severity": error.severity.value if error.severity else "high",
+                            "category": error.category.value if error.category else "SERVER",
+                            "correlation_id": error.correlation_id,
+                            "timestamp": error.timestamp.isoformat() 
+                        }
+                    }
+                    await websocket.send_json(fallback_error)
+
+            except WebSocketDisconnect:
+                logger.info(f"Client {client_id} disconnected before error could be sent.")
+            except Exception as e:
+                logger.error(f"Failed to send error to client {client_id}: {e}", exc_info=True)
     
     async def _check_error_thresholds(self, error: WebSocketError):
         """Check if error thresholds are exceeded and take action."""
@@ -518,84 +585,41 @@ class ErrorHandler:
         """Clear error history and reset counters."""
         self.error_history.clear()
         self.error_counts.clear()
-
-
-# Convenience functions for common error scenarios
-async def handle_websocket_disconnect(error_handler: ErrorHandler, 
-                                    client_id: str, 
-                                    disconnect_exception: WebSocketDisconnect):
-    """Handle WebSocket disconnection with proper error logging."""
-    context = ErrorContext(client_id=client_id)
     
-    if disconnect_exception.code == 1000:  # Normal closure
-        severity = ErrorSeverity.INFO
-        message = "Client disconnected normally"
-    elif disconnect_exception.code in [1001, 1005, 1006]:  # Going away, no status, abnormal
-        severity = ErrorSeverity.MEDIUM
-        message = f"Client disconnected unexpectedly: {disconnect_exception.reason or 'Unknown reason'}"
-    else:
-        severity = ErrorSeverity.HIGH
-        message = f"Client disconnected with error code {disconnect_exception.code}: {disconnect_exception.reason}"
-    
-    await error_handler.handle_error(
-        ErrorCode.CONNECTION_LOST,
-        message,
-        severity,
-        ErrorCategory.CONNECTION,
-        context,
-        disconnect_exception
-    )
-
-
-async def handle_invalid_message(error_handler: ErrorHandler,
-                                client_id: str,
-                                raw_message: str,
-                                validation_error: Exception,
-                                websocket: WebSocket):
-    """Handle invalid message format or validation errors."""
-    context = ErrorContext(
-        client_id=client_id,
-        message_id=str(uuid.uuid4())[:8],
-        metadata={"raw_message_length": len(raw_message)}
-    )
-    
-    await error_handler.handle_error(
-        ErrorCode.INVALID_MESSAGE_FORMAT,
-        f"Message validation failed: {str(validation_error)}",
-        ErrorSeverity.MEDIUM,
-        ErrorCategory.VALIDATION,
-        context,
-        validation_error,
-        websocket
-    )
-
-
-async def handle_rate_limit_violation(error_handler: ErrorHandler,
-                                    client_id: str,
-                                    current_rate: float,
-                                    limit: float,
-                                    websocket: WebSocket):
-    """Handle rate limiting violations."""
-    context = ErrorContext(
-        client_id=client_id,
-        metadata={"current_rate": current_rate, "limit": limit}
-    )
-    
-    await error_handler.handle_error(
-        ErrorCode.RATE_LIMIT_EXCEEDED,
-        f"Rate limit exceeded: {current_rate:.2f}/s > {limit:.2f}/s",
-        ErrorSeverity.MEDIUM,
-        ErrorCategory.RATE_LIMIT,
-        context,
-        websocket=websocket
-    )
-
-
-# Global error handler instance
-global_error_handler = ErrorHandler(
-    log_level="INFO",
-    error_log_file=None  # No file logging by default
-)
-
-# Alias for backwards compatibility
-WebSocketErrorHandler = ErrorHandler 
+    async def handle_websocket_error(self, client_id: str, exception: Exception) -> WebSocketError:
+        """Handle WebSocket-specific errors with appropriate categorization."""
+        # Determine error code and category based on exception type
+        if isinstance(exception, WebSocketDisconnect) if FASTAPI_AVAILABLE else False:
+            error_code = ErrorCode.CONNECTION_LOST
+            category = ErrorCategory.CONNECTION
+            severity = ErrorSeverity.MEDIUM
+        elif "timeout" in str(exception).lower():
+            error_code = ErrorCode.CONNECTION_TIMEOUT
+            category = ErrorCategory.TIMEOUT
+            severity = ErrorSeverity.HIGH
+        elif "auth" in str(exception).lower():
+            error_code = ErrorCode.AUTH_FAILED
+            category = ErrorCategory.AUTHENTICATION
+            severity = ErrorSeverity.MEDIUM
+        elif "validation" in str(exception).lower() or "invalid" in str(exception).lower():
+            error_code = ErrorCode.VALIDATION_FAILED
+            category = ErrorCategory.VALIDATION
+            severity = ErrorSeverity.MEDIUM
+        else:
+            error_code = ErrorCode.INTERNAL_SERVER_ERROR
+            category = ErrorCategory.SERVER
+            severity = ErrorSeverity.HIGH
+        
+        context = ErrorContext(
+            client_id=client_id,
+            metadata={"exception_type": type(exception).__name__}
+        )
+        
+        return await self.handle_error(
+            error_code=error_code,
+            message=f"WebSocket error for client {client_id}: {str(exception)}",
+            severity=severity,
+            category=category,
+            context=context,
+            original_exception=exception
+        )

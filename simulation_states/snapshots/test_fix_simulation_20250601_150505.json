@@ -1,0 +1,13 @@
+{
+  "simulation_id": "test_fix_simulation",
+  "generation": 0,
+  "timestamp": "2025-06-01T15:05:05.788969",
+  "state": "error",
+  "progress_percentage": 0.0,
+  "population_size": 500,
+  "resistance_frequency": 0.0,
+  "metadata": {
+    "created_by": "simulation_service",
+    "version": "1.0"
+  }
+}

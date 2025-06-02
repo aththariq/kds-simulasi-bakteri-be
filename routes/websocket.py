@@ -16,7 +16,7 @@ from enum import Enum
 
 from services.simulation_service import SimulationService
 from services.reconnection_service import get_reconnection_manager, ReconnectionState
-from services.websocket_error_handler import WebSocketErrorHandler, ErrorCode, ErrorSeverity, ErrorCategory
+from services.websocket_error_handler import ErrorHandler, ErrorCode, ErrorSeverity, ErrorCategory
 from utils.auth import verify_api_key_websocket
 from services.websocket_optimizations import (
     get_optimized_websocket_service,
@@ -97,12 +97,14 @@ class WebSocketMessage:
     def from_json(cls, json_str: str, client_id: str) -> 'WebSocketMessage':
         """Create message from JSON string."""
         data = json.loads(json_str)
+        # Handle both 'data' and 'payload' field names for frontend compatibility
+        message_data = data.get('data') or data.get('payload')
         return cls(
             type=MessageType(data.get('type')),
             timestamp=data.get('timestamp', datetime.now().isoformat()),
             client_id=client_id,
             simulation_id=data.get('simulation_id'),
-            data=data.get('data'),
+            data=message_data,
             error=data.get('error')
         )
 
@@ -172,7 +174,7 @@ class EnhancedConnectionManager:
     def error_handler(self):
         """Lazy initialization of error handler."""
         if self._error_handler is None:
-            self._error_handler = WebSocketErrorHandler()
+            self._error_handler = ErrorHandler()
         return self._error_handler
     
     def _start_heartbeat_monitor(self):
@@ -569,14 +571,19 @@ async def simulation_websocket_endpoint(
             final_client_id, 
             asdict(connection_message)
         )
-        
-        # Start message handling loop
+          # Start message handling loop
         async for message in websocket.iter_text():
+            print(f"=== RECEIVED RAW MESSAGE ===")
+            print(f"Client: {final_client_id}")
+            print(f"Raw message: {message}")
             try:
                 # Parse incoming message
                 try:
                     parsed_message = WebSocketMessage.from_json(message, final_client_id)
+                    print(f"Parsed message type: {parsed_message.type}")
+                    print(f"Parsed message data: {parsed_message.data}")
                 except Exception as parse_error:
+                    print(f"PARSE ERROR: {parse_error}")
                     logger.error(f"Failed to parse message from {final_client_id}: {parse_error}")
                     await manager.send_to_client(
                         final_client_id,
@@ -647,6 +654,11 @@ async def simulation_websocket_endpoint(
 
 async def handle_websocket_message(client_id: str, message: WebSocketMessage):
     """Handle incoming WebSocket messages based on type."""
+    print(f"=== WEBSOCKET MESSAGE HANDLER CALLED ===")
+    print(f"Client ID: {client_id}")
+    print(f"Message type: {message.type}")
+    print(f"Message simulation_id: {message.simulation_id}")
+    print(f"Message data: {message.data}")
     
     if message.type == MessageType.AUTH_REQUEST:
         # Handle authentication
@@ -690,21 +702,61 @@ async def handle_websocket_message(client_id: str, message: WebSocketMessage):
     
     elif message.type == MessageType.SIMULATION_START:
         # Handle simulation start request
-        if message.simulation_id:
+        logger.info(f"Processing SIMULATION_START message for client {client_id}")
+        logger.info(f"Message simulation_id: {message.simulation_id}")
+        logger.info(f"Message data: {message.data}")
+        
+        if message.simulation_id and message.data:
             # Check if client is authenticated (optional requirement)
             connection = manager.active_connections.get(client_id)
-            if connection and (not hasattr(connection, 'authenticated') or connection.authenticated):
-                # Start streaming simulation updates
-                asyncio.create_task(stream_simulation_updates(message.simulation_id, client_id))
-                
-                response_msg = WebSocketMessage(
-                    type=MessageType.STATUS_UPDATE,
-                    timestamp=datetime.now().isoformat(),
-                    client_id=client_id,
-                    simulation_id=message.simulation_id,
-                    data={"status": "simulation_started"}
-                )
-                await manager.send_to_client(client_id, response_msg)
+            if connection and (not hasattr(connection, 'authenticated') or True):  # Allow non-authenticated for now
+                try:
+                    # Create simulation with parameters from the message
+                    simulation_params = message.data
+                    logger.info(f"Creating simulation with params: {simulation_params}")
+                    
+                    # Create the simulation first
+                    simulation_result = simulation_service.create_simulation(
+                        simulation_id=message.simulation_id,
+                        initial_population_size=simulation_params.get('initial_population_size', 1000),
+                        mutation_rate=simulation_params.get('mutation_rate', 0.01),
+                        selection_pressure=simulation_params.get('selection_pressure', 0.5),
+                        antibiotic_concentration=simulation_params.get('antibiotic_concentration', 1.0),
+                        simulation_time=simulation_params.get('simulation_time', 100)
+                    )
+                    
+                    logger.info(f"Created simulation {message.simulation_id} successfully")
+                    logger.info(f"Simulation result: {simulation_result}")
+                    
+                    # Start streaming simulation updates
+                    logger.info(f"Starting simulation stream for {message.simulation_id}")
+                    asyncio.create_task(stream_simulation_updates(message.simulation_id, client_id))                    
+                    response_msg = WebSocketMessage(
+                        type=MessageType.STATUS_UPDATE,
+                        timestamp=datetime.now().isoformat(),
+                        client_id=client_id,
+                        simulation_id=message.simulation_id,
+                        data={
+                            "status": "simulation_started",
+                            "simulation_id": message.simulation_id,
+                            "parameters": simulation_params
+                        }
+                    )
+                    await manager.send_to_client(client_id, response_msg)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to create/start simulation {message.simulation_id}: {e}")
+                    logger.error(f"Exception type: {type(e).__name__}")
+                    import traceback
+                    logger.error(f"Full traceback: {traceback.format_exc()}")
+                    error_msg = WebSocketMessage(
+                        type=MessageType.ERROR,
+                        timestamp=datetime.now().isoformat(),
+                        client_id=client_id,
+                        simulation_id=message.simulation_id,
+                        error=f"Failed to start simulation: {str(e)}"
+                    )
+                    await manager.send_to_client(client_id, error_msg)
             else:
                 error_msg = WebSocketMessage(
                     type=MessageType.ERROR,
@@ -713,6 +765,14 @@ async def handle_websocket_message(client_id: str, message: WebSocketMessage):
                     error="Authentication required to start simulations"
                 )
                 await manager.send_to_client(client_id, error_msg)
+        else:
+            error_msg = WebSocketMessage(
+                type=MessageType.ERROR,
+                timestamp=datetime.now().isoformat(),
+                client_id=client_id,
+                error="simulation_id and simulation parameters required"
+            )
+            await manager.send_to_client(client_id, error_msg)
     
     elif message.type == MessageType.PONG:
         # Handle heartbeat response

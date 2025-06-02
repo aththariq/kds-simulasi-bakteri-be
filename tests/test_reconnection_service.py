@@ -13,7 +13,7 @@ from services.reconnection_service import (
     ExponentialBackoffStrategy, NetworkConditionDetector, ReconnectionManager,
     get_reconnection_manager, initialize_reconnection_manager, shutdown_reconnection_manager
 )
-from services.websocket_error_handler import WebSocketErrorHandler
+from services.websocket_error_handler import ErrorHandler
 
 
 class TestReconnectionConfig:
@@ -322,7 +322,7 @@ class TestReconnectionManager:
     @pytest.fixture
     def error_handler(self):
         """Mock error handler."""
-        return AsyncMock(spec=WebSocketErrorHandler)
+        return AsyncMock(spec=ErrorHandler)
     
     @pytest.fixture
     def manager(self, config, error_handler):

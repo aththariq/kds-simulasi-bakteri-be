@@ -23,6 +23,7 @@ import uuid
 import logging
 import struct
 from collections import defaultdict, deque
+from schemas.websocket_protocol import MessageType
 
 try:
     import msgpack
@@ -161,9 +162,22 @@ class BinaryMessageEncoder:
             optimization_level=optimization_level
         )
         
+        # Helper for JSON serialization
+        def serializer_helper(obj):
+            if isinstance(obj, Enum): # Catches MessageType and other enums
+                return obj.value
+            # For objects not handled by this, let json.dumps raise the default TypeError
+            raise TypeError(f"Object of type {obj.__class__.__name__} is not handled by serializer_helper for JSON encoding")
+
         # Calculate original JSON size
-        json_data = json.dumps(message, separators=(',', ':')).encode('utf-8')
-        metrics.original_json_size = len(json_data)
+        try:
+            json_data = json.dumps(message, separators=(',', ':'), default=serializer_helper).encode('utf-8')
+            metrics.original_json_size = len(json_data)
+        except TypeError as e:
+            logger.error(f"JSON serialization error in encode_message: {e}")
+            # Consider logging parts of the message for debugging, carefully if it contains sensitive data
+            logger.debug(f"Message structure that caused serialization error (first 500 chars): {str(message)[:500]}")
+            raise
         
         if optimization_level == MessageOptimizationLevel.NONE:
             # No optimization - return JSON
@@ -180,9 +194,17 @@ class BinaryMessageEncoder:
         
         # Encode with MessagePack
         encoding_start = time.time()
-        binary_data = msgpack.packb(message, use_bin_type=True)
-        metrics.encoding_time = time.time() - encoding_start
-        metrics.encoding = MessageEncoding.MSGPACK
+        try:
+            binary_data = msgpack.packb(message, use_bin_type=True, default=serializer_helper)
+            metrics.encoding_time = time.time() - encoding_start
+            metrics.encoding = MessageEncoding.MSGPACK
+        except TypeError as e:
+            logger.error(f"MessagePack serialization error in encode_message: {e}")
+            logger.debug(f"Message structure that caused msgpack serialization error (first 500 chars): {str(message)[:500]}")
+            # Fallback to JSON if msgpack fails fundamentally with this structure even with helper
+            logger.warning("Falling back to JSON due to MessagePack serialization error.")
+            json_data, metrics = self.encode_message(message, MessageOptimizationLevel.NONE) # Recursive call with NO optimization
+            return json_data, metrics 
         
         result_data = binary_data
         metrics.optimized_size = len(binary_data)

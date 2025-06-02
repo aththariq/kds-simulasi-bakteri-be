@@ -9,7 +9,7 @@ validation rules, and versioning strategy.
 
 from typing import Dict, List, Optional, Any, Union, Literal
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, auto
 from datetime import datetime
 import json
 import uuid
@@ -34,112 +34,73 @@ class MessageCategory(Enum):
     SYSTEM = "system"
 
 
-class MessageType(Enum):
+class MessageType(str, Enum):
     """Comprehensive WebSocket message types organized by category."""
     
-    # Connection Lifecycle (CONNECTION category)
-    CONNECTION_ESTABLISHED = "connection_established"
-    CONNECTION_TERMINATED = "connection_terminated"
-    CONNECTION_INFO = "connection_info"
-    CONNECTION_STATS = "connection_stats"
+    # Client to Server
+    START_SIMULATION = "START_SIMULATION"
+    PAUSE_SIMULATION = "PAUSE_SIMULATION"
+    RESUME_SIMULATION = "RESUME_SIMULATION"
+    STOP_SIMULATION = "STOP_SIMULATION"
+    GET_STATUS = "GET_STATUS"
+    UPDATE_PARAMETERS = "UPDATE_PARAMETERS"
+    CLIENT_READY = "CLIENT_READY"  # New: Client signals readiness
+    REQUEST_RECONNECT = "REQUEST_RECONNECT" # Client requests reconnection
     
-    # Authentication (AUTHENTICATION category)
-    AUTH_REQUEST = "auth_request"
-    AUTH_SUCCESS = "auth_success"
-    AUTH_FAILED = "auth_failed"
-    AUTH_REFRESH = "auth_refresh"
-    AUTH_LOGOUT = "auth_logout"
+    # Authentication
+    AUTH_REQUEST = "AUTH_REQUEST"
+    AUTH_SUCCESS = "AUTH_SUCCESS"
+    AUTH_FAILED = "AUTH_FAILED"
     
-    # Subscription Management (SUBSCRIPTION category)
-    SUBSCRIBE = "subscribe"
-    UNSUBSCRIBE = "unsubscribe"
-    SUBSCRIPTION_CONFIRMED = "subscription_confirmed"
-    UNSUBSCRIPTION_CONFIRMED = "unsubscription_confirmed"
-    SUBSCRIPTION_LIST = "subscription_list"
-    SUBSCRIPTION_ERROR = "subscription_error"
-    
-    # Simulation Control (SIMULATION category)
-    SIMULATION_START = "simulation_start"
-    SIMULATION_STOP = "simulation_stop"
-    SIMULATION_PAUSE = "simulation_pause"
-    SIMULATION_RESUME = "simulation_resume"
-    SIMULATION_RESET = "simulation_reset"
-    SIMULATION_CONFIG = "simulation_config"
-    SIMULATION_STATUS = "simulation_status"
-    
-    # Data Updates (DATA category)
-    SIMULATION_UPDATE = "simulation_update"
-    PERFORMANCE_UPDATE = "performance_update"
-    STATUS_UPDATE = "status_update"
-    BATCH_UPDATE = "batch_update"
-    SNAPSHOT_UPDATE = "snapshot_update"
-    METRICS_UPDATE = "metrics_update"
-    
-    # Error Handling (ERROR category)
-    ERROR = "error"
-    WARNING = "warning"
-    VALIDATION_ERROR = "validation_error"
-    RATE_LIMIT_ERROR = "rate_limit_error"
-    
-    # Heartbeat (HEARTBEAT category)
-    PING = "ping"
-    PONG = "pong"
-    
-    # System Management (SYSTEM category)
-    SYSTEM_STATUS = "system_status"
-    SYSTEM_SHUTDOWN = "system_shutdown"
-    SYSTEM_MAINTENANCE = "system_maintenance"
-    
+    # Subscription management
+    SUBSCRIBE = "SUBSCRIBE"
+    UNSUBSCRIBE = "UNSUBSCRIBE"
+    SUBSCRIPTION_CONFIRMED = "SUBSCRIPTION_CONFIRMED"
+    UNSUBSCRIPTION_CONFIRMED = "UNSUBSCRIPTION_CONFIRMED"
+
+    # Server to Client
+    SIMULATION_STARTED = "SIMULATION_STARTED"
+    SIMULATION_PAUSED = "SIMULATION_PAUSED"
+    SIMULATION_RESUMED = "SIMULATION_RESUMED"
+    SIMULATION_STOPPED = "SIMULATION_STOPPED"
+    SIMULATION_COMPLETED = "SIMULATION_COMPLETED"
+    STATUS_UPDATE = "STATUS_UPDATE"
+    DATA_UPDATE = "DATA_UPDATE"
+    ERROR = "ERROR"
+    WARNING = "WARNING"
+    PONG = "PONG"  # Response to PING
+    RECONNECT_TOKEN = "RECONNECT_TOKEN" # Server provides a token for reconnection
+    RECONNECTION_SUCCESSFUL = "RECONNECTION_SUCCESSFUL"
+    RECONNECTION_FAILED = "RECONNECTION_FAILED"
+    SYSTEM_STATUS = "SYSTEM_STATUS" # Added based on error
+    CONNECTION_ESTABLISHED = "CONNECTION_ESTABLISHED" # Added based on error
+    CONNECTION_TERMINATED = "CONNECTION_TERMINATED"
+
+    # Bidirectional
+    PING = "PING"
+    HEARTBEAT = "HEARTBEAT"  # Used for keep-alive
+    DEBUG = "DEBUG" # For debugging purposes
+    CONTROL_MESSAGE = "CONTROL_MESSAGE" # Generic control messages
+    INFO = "INFO" # General information messages
+
     @classmethod
     def get_category(cls, message_type: 'MessageType') -> MessageCategory:
         """Get the category for a given message type."""
-        category_mapping = {
-            cls.CONNECTION_ESTABLISHED: MessageCategory.CONNECTION,
-            cls.CONNECTION_TERMINATED: MessageCategory.CONNECTION,
-            cls.CONNECTION_INFO: MessageCategory.CONNECTION,
-            cls.CONNECTION_STATS: MessageCategory.CONNECTION,
-            
-            cls.AUTH_REQUEST: MessageCategory.AUTHENTICATION,
-            cls.AUTH_SUCCESS: MessageCategory.AUTHENTICATION,
-            cls.AUTH_FAILED: MessageCategory.AUTHENTICATION,
-            cls.AUTH_REFRESH: MessageCategory.AUTHENTICATION,
-            cls.AUTH_LOGOUT: MessageCategory.AUTHENTICATION,
-            
-            cls.SUBSCRIBE: MessageCategory.SUBSCRIPTION,
-            cls.UNSUBSCRIBE: MessageCategory.SUBSCRIPTION,
-            cls.SUBSCRIPTION_CONFIRMED: MessageCategory.SUBSCRIPTION,
-            cls.UNSUBSCRIPTION_CONFIRMED: MessageCategory.SUBSCRIPTION,
-            cls.SUBSCRIPTION_LIST: MessageCategory.SUBSCRIPTION,
-            cls.SUBSCRIPTION_ERROR: MessageCategory.SUBSCRIPTION,
-            
-            cls.SIMULATION_START: MessageCategory.SIMULATION,
-            cls.SIMULATION_STOP: MessageCategory.SIMULATION,
-            cls.SIMULATION_PAUSE: MessageCategory.SIMULATION,
-            cls.SIMULATION_RESUME: MessageCategory.SIMULATION,
-            cls.SIMULATION_RESET: MessageCategory.SIMULATION,
-            cls.SIMULATION_CONFIG: MessageCategory.SIMULATION,
-            cls.SIMULATION_STATUS: MessageCategory.SIMULATION,
-            
-            cls.SIMULATION_UPDATE: MessageCategory.DATA,
-            cls.PERFORMANCE_UPDATE: MessageCategory.DATA,
-            cls.STATUS_UPDATE: MessageCategory.DATA,
-            cls.BATCH_UPDATE: MessageCategory.DATA,
-            cls.SNAPSHOT_UPDATE: MessageCategory.DATA,
-            cls.METRICS_UPDATE: MessageCategory.DATA,
-            
-            cls.ERROR: MessageCategory.ERROR,
-            cls.WARNING: MessageCategory.ERROR,
-            cls.VALIDATION_ERROR: MessageCategory.ERROR,
-            cls.RATE_LIMIT_ERROR: MessageCategory.ERROR,
-            
-            cls.PING: MessageCategory.HEARTBEAT,
-            cls.PONG: MessageCategory.HEARTBEAT,
-            
-            cls.SYSTEM_STATUS: MessageCategory.SYSTEM,
-            cls.SYSTEM_SHUTDOWN: MessageCategory.SYSTEM,
-            cls.SYSTEM_MAINTENANCE: MessageCategory.SYSTEM,
-        }
-        return category_mapping.get(message_type, MessageCategory.SYSTEM)
+        # Simplified mapping based on current MessageType values
+        if message_type in [cls.START_SIMULATION, cls.PAUSE_SIMULATION, cls.RESUME_SIMULATION, cls.STOP_SIMULATION, cls.UPDATE_PARAMETERS]:
+            return MessageCategory.SIMULATION
+        elif message_type in [cls.SIMULATION_STARTED, cls.SIMULATION_PAUSED, cls.SIMULATION_RESUMED, cls.SIMULATION_STOPPED, cls.SIMULATION_COMPLETED, cls.DATA_UPDATE]:
+            return MessageCategory.DATA
+        elif message_type == cls.GET_STATUS or message_type == cls.STATUS_UPDATE or message_type == cls.SYSTEM_STATUS:
+            return MessageCategory.SYSTEM
+        elif message_type == cls.ERROR:
+            return MessageCategory.ERROR
+        elif message_type in [cls.PING, cls.PONG, cls.HEARTBEAT]:
+            return MessageCategory.HEARTBEAT
+        elif message_type in [cls.CLIENT_READY, cls.REQUEST_RECONNECT, cls.RECONNECT_TOKEN, cls.RECONNECTION_SUCCESSFUL, cls.RECONNECTION_FAILED, cls.CONNECTION_ESTABLISHED]:
+            return MessageCategory.CONNECTION
+        # Default or more granular categories can be added here
+        return MessageCategory.SYSTEM # Default category
 
 
 class Priority(Enum):

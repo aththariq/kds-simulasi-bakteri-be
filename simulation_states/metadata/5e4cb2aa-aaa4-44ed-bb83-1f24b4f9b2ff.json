@@ -1,0 +1,30 @@
+{
+  "simulation_id": "5e4cb2aa-aaa4-44ed-bb83-1f24b4f9b2ff",
+  "state": "initialized",
+  "created_at": "2025-06-01T15:30:50.147250",
+  "updated_at": "2025-06-01T15:30:50.147250",
+  "parameters": {
+    "initial_population_size": 10,
+    "mutation_rate": 0.001,
+    "selection_pressure": 0.1,
+    "antibiotic_concentration": 1.0,
+    "simulation_time": 1
+  },
+  "current_generation": 0,
+  "progress_percentage": 0.0,
+  "metadata": {
+    "created_by": "simulation_service",
+    "version": "1.0"
+  },
+  "performance_metrics": {
+    "start_time": null,
+    "end_time": null,
+    "generation_times": [],
+    "memory_usage": [],
+    "state_transitions": []
+  },
+  "checkpoints": [],
+  "last_snapshot": null,
+  "error_history": [],
+  "recovery_points": []
+}

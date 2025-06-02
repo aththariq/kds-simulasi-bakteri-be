@@ -654,6 +654,94 @@ class OptimizedPopulation:
         return (f"OptimizedPopulation(config={self.config}, "
                 f"size={len(self.bacteria_by_id)}, generation={self.generation})")
 
+    def mutate(self, mutation_rate: float = 0.001) -> List[Dict[str, Any]]:
+        """
+        Apply mutations to the population with the given mutation rate.
+        
+        Args:
+            mutation_rate: Probability of mutation per bacterium
+            
+        Returns:
+            List of mutation events that occurred
+        """
+        mutation_events = []
+        
+        for bacterium in list(self.bacteria_by_id.values()):
+            if random.random() < mutation_rate:
+                # Track mutation before applying it
+                old_resistance = bacterium.resistance_status
+                
+                # Apply mutation
+                if bacterium.resistance_status == ResistanceStatus.SENSITIVE:
+                    # Mutation to resistance
+                    bacterium.resistance_status = ResistanceStatus.RESISTANT
+                    bacterium._survival_bonus = 0.1
+                    # Slightly reduced fitness due to resistance cost
+                    bacterium.fitness *= 0.95
+                    
+                    # Update indices
+                    self.sensitive_bacteria.discard(bacterium.id)
+                    self.resistant_bacteria.add(bacterium.id)
+                    
+                else:
+                    # Resistant bacteria can mutate to become more or less fit
+                    fitness_change = random.uniform(-0.1, 0.1)
+                    bacterium.fitness = max(0.1, bacterium.fitness + fitness_change)
+                
+                # Record mutation event
+                mutation_events.append({
+                    "bacterium_id": bacterium.id,
+                    "generation": self.generation,
+                    "old_resistance": old_resistance.value,
+                    "new_resistance": bacterium.resistance_status.value,
+                    "fitness_change": bacterium.fitness,
+                    "mutation_type": "resistance_acquired" if old_resistance == ResistanceStatus.SENSITIVE else "fitness_modified"
+                })
+        
+        # Mark stats as dirty since resistance composition changed
+        self._stats_dirty = True
+        
+        return mutation_events
+    
+    def get_average_resistance(self) -> float:
+        """
+        Get the average resistance frequency in the population.
+        
+        Returns:
+            Float between 0 and 1 representing the fraction of resistant bacteria
+        """
+        if len(self.bacteria_by_id) == 0:
+            return 0.0
+        
+        return len(self.resistant_bacteria) / len(self.bacteria_by_id)
+    
+    def calculate_diversity_index(self) -> float:
+        """
+        Calculate the Shannon diversity index for the population.
+        
+        Returns:
+            Shannon diversity index value
+        """
+        if len(self.bacteria_by_id) == 0:
+            return 0.0
+        
+        total_count = len(self.bacteria_by_id)
+        resistant_count = len(self.resistant_bacteria)
+        sensitive_count = len(self.sensitive_bacteria)
+        
+        # Calculate Shannon diversity based on resistance status
+        diversity = 0.0
+        
+        if resistant_count > 0:
+            p_resistant = resistant_count / total_count
+            diversity -= p_resistant * np.log2(p_resistant)
+        
+        if sensitive_count > 0:
+            p_sensitive = sensitive_count / total_count
+            diversity -= p_sensitive * np.log2(p_sensitive)
+        
+        return diversity
+
 
 # Maintain backward compatibility
 Population = OptimizedPopulation 

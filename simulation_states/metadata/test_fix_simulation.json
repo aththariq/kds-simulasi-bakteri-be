@@ -1,0 +1,60 @@
+{
+  "simulation_id": "test_fix_simulation",
+  "state": "error",
+  "created_at": "2025-06-01T15:14:03.180278",
+  "updated_at": "2025-06-01T15:14:03.469760",
+  "parameters": {
+    "initial_population_size": 500,
+    "mutation_rate": 0.01,
+    "selection_pressure": 0.2,
+    "antibiotic_concentration": 1.0,
+    "simulation_time": 20
+  },
+  "current_generation": 0,
+  "progress_percentage": 0.0,
+  "metadata": {
+    "created_by": "simulation_service",
+    "version": "1.0"
+  },
+  "performance_metrics": {
+    "start_time": null,
+    "end_time": null,
+    "generation_times": [],
+    "memory_usage": [],
+    "state_transitions": [
+      {
+        "from_state": "initialized",
+        "to_state": "running",
+        "timestamp": "2025-06-01T15:14:03.467765",
+        "generation": 0
+      },
+      {
+        "from_state": "running",
+        "to_state": "error",
+        "timestamp": "2025-06-01T15:14:03.469760",
+        "generation": 0
+      }
+    ]
+  },
+  "checkpoints": [],
+  "last_snapshot": {
+    "simulation_id": "test_fix_simulation",
+    "generation": 0,
+    "timestamp": "2025-06-01T15:14:03.469760",
+    "state": "error",
+    "progress_percentage": 0.0,
+    "population_size": 500,
+    "resistance_frequency": 0.0,
+    "metadata": {
+      "created_by": "simulation_service",
+      "version": "1.0"
+    }
+  },
+  "error_history": [],
+  "recovery_points": [],
+  "population_size": 500,
+  "status": "initialized",
+  "start_time": "2025-06-01T15:14:03.467765",
+  "error_message": "'OptimizedPopulation' object has no attribute 'fitness'",
+  "error_time": "2025-06-01T15:14:03.469760"
+}
