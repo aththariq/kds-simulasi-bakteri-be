@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from enum import Enum
 
+# Import MessageType and WebSocketProtocolMessage from the protocol schema
+from schemas.websocket_protocol import MessageType, WebSocketProtocolMessage, MessageFactory
 from services.simulation_service import SimulationService
 from services.reconnection_service import get_reconnection_manager, ReconnectionState
 from services.websocket_error_handler import ErrorHandler, ErrorCode, ErrorSeverity, ErrorCategory
@@ -40,46 +42,9 @@ class ConnectionState(Enum):
     ERROR = "error"
 
 
-class MessageType(Enum):
-    """WebSocket message types."""
-    # Connection lifecycle
-    CONNECTION_ESTABLISHED = "connection_established"
-    CONNECTION_TERMINATED = "connection_terminated"
-    
-    # Authentication
-    AUTH_REQUEST = "auth_request"
-    AUTH_SUCCESS = "auth_success"
-    AUTH_FAILED = "auth_failed"
-    
-    # Subscription management
-    SUBSCRIBE = "subscribe"
-    UNSUBSCRIBE = "unsubscribe"
-    SUBSCRIPTION_CONFIRMED = "subscription_confirmed"
-    UNSUBSCRIPTION_CONFIRMED = "unsubscription_confirmed"
-    
-    # Simulation control
-    SIMULATION_START = "simulation_start"
-    SIMULATION_STOP = "simulation_stop"
-    SIMULATION_PAUSE = "simulation_pause"
-    SIMULATION_RESUME = "simulation_resume"
-    
-    # Data updates
-    SIMULATION_UPDATE = "simulation_update"
-    PERFORMANCE_UPDATE = "performance_update"
-    STATUS_UPDATE = "status_update"
-    
-    # Error handling
-    ERROR = "error"
-    WARNING = "warning"
-    
-    # Heartbeat
-    PING = "ping"
-    PONG = "pong"
-
-
 @dataclass
 class WebSocketMessage:
-    """Standardized WebSocket message structure."""
+    """Simplified WebSocket message structure for backward compatibility."""
     type: MessageType
     timestamp: str
     client_id: str
@@ -99,13 +64,37 @@ class WebSocketMessage:
         data = json.loads(json_str)
         # Handle both 'data' and 'payload' field names for frontend compatibility
         message_data = data.get('data') or data.get('payload')
+        
+        # Convert string message type to MessageType enum
+        message_type_str = data.get('type', '').upper()
+        try:
+            message_type = MessageType(message_type_str)
+        except ValueError:
+            # Try lowercase version for backward compatibility
+            try:
+                message_type = MessageType(data.get('type'))
+            except ValueError:
+                logger.warning(f"Unknown message type: {data.get('type')}")
+                message_type = MessageType.ERROR
+        
         return cls(
-            type=MessageType(data.get('type')),
+            type=message_type,
             timestamp=data.get('timestamp', datetime.now().isoformat()),
             client_id=client_id,
             simulation_id=data.get('simulation_id'),
             data=message_data,
             error=data.get('error')
+        )
+    
+    def to_protocol_message(self) -> WebSocketProtocolMessage:
+        """Convert to protocol message format."""
+        return WebSocketProtocolMessage(
+            type=self.type,
+            timestamp=self.timestamp,
+            client_id=self.client_id,
+            simulation_id=self.simulation_id,
+            data=self.data,
+            error={"error_message": self.error, "error_code": "GENERAL_ERROR"} if self.error else None
         )
 
 
